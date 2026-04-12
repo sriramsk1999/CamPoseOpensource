@@ -226,7 +226,6 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
     parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit','articubot_dit_rgb'], help='policy class')
-    parser.add_argument('--use_pointmaps', default=False, type=str2bool, help='render pointmaps alongside RGB for RoPE4D policies')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 

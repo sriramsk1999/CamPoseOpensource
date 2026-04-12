@@ -249,7 +249,7 @@ class EpisodicDataset(Dataset):
         self.args = args
         self.image_size = 256
         self.use_plucker = args.use_plucker
-        self.use_pointmaps = args.use_pointmaps
+        self.is_articubot = args.policy_class in ('articubot_dit', 'articubot_dit_rgb')
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         self.env = env
 
@@ -376,7 +376,7 @@ class EpisodicDataset(Dataset):
             if cam2world_gl_np.ndim == 3:
                 cam2world_gl_np = cam2world_gl_np[0]
 
-            if self.use_pointmaps:
+            if self.is_articubot:
                 camera.capture()
                 obs_dict = camera.get_obs(
                     rgb=True, depth=False, position=True,
@@ -412,7 +412,7 @@ class EpisodicDataset(Dataset):
                 _, H, W = rgb_tensor.shape
                 plucker_tensor = torch.zeros(6, H, W, device=rgb_tensor.device)
 
-            if self.use_pointmaps:
+            if self.is_articubot:
                 pointmap_tensor = torch.from_numpy(pointmap_np).float().cuda()
                 rgb_c = self._paired_crop(rgb_tensor)
                 pointmap_c = self._paired_crop(pointmap_tensor)
@@ -471,7 +471,7 @@ class EpisodicDataset(Dataset):
             'cam_extrinsics_full': cam_extrinsics_stack,  # (num_cams, 4, 4) c2w (GL)
             'cam_intrinsics_full': cam_intrinsics_stack,  # (num_cams, 3, 3)
         }
-        if self.use_pointmaps:
+        if self.is_articubot:
             out['pointmap'] = torch.stack(cam_pointmaps, dim=0)  # (num_cams, 3, H, W)
         return out
 

@@ -100,10 +100,9 @@ class Evaluator:
         self.intrinsics = self._get_camera_intrinsics()
 
         # articubot_dit{,_rgb} feeds center-cropped (crop_dst, crop_dst) tensors
-        # to the policy. For the RoPE4D variant we also adjust K accordingly.
+        # to the policy and additionally consumes depth-derived pointmaps.
         # Crop constants are static (center crop), so precompute them once.
-        self.use_pointmaps = bool(getattr(args, 'use_pointmaps', False))
-        self.is_articubot_rgb = getattr(args, 'policy_class', '') == 'articubot_dit_rgb'
+        self.is_articubot = getattr(args, 'policy_class', '') in ('articubot_dit', 'articubot_dit_rgb')
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2
         self.crop_left = (self.W - self.crop_dst) // 2
@@ -220,22 +219,8 @@ class Evaluator:
             ], dtype=np.float32)
         ).unsqueeze(0).cuda()
 
-    def _build_rgb_batch(self, per_cam_images, pose_set):
-        """articubot_dit_rgb inference batch. Center-crop 256→crop_dst RGB only."""
-        top, left, dst = self.crop_top, self.crop_left, self.crop_dst
-        imgs = []
-        for rgb_np, cam_pose in zip(per_cam_images, pose_set):
-            plu_pose = None if self.args.default_cam else cam_pose
-            rgb_plu = self._image_to_tensor(rgb_np, plu_pose)  # (9, 256, 256) cpu
-            imgs.append(rgb_plu[:, top:top + dst, left:left + dst])
-        return {
-            'image': torch.stack(imgs, dim=0).unsqueeze(0).cuda(),
-            'eef_xyz': self._eef_xyz(),
-            'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
-        }
-
     def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set):
-        """articubot_dit inference batch. Center-crop 256→crop_dst with matching K."""
+        """Inference batch. Center-crop 256→crop_dst with matching K."""
         top, left, dst = self.crop_top, self.crop_left, self.crop_dst
         imgs, pms, extrs = [], [], []
         for rgb_np, pm_np, cam_pose in zip(per_cam_rgb, per_cam_pointmaps, per_cam_poses):
@@ -299,7 +284,7 @@ class Evaluator:
                 pose_set = [poses_list[2 * episode_num], poses_list[2 * episode_num + 1]]
         
         while not done and step < self.max_steps:
-            if self.use_pointmaps:
+            if self.is_articubot:
                 per_cam = [self._render_cam_rgbd(p) for p in pose_set]
                 per_cam_images = [x[0] for x in per_cam]
                 per_cam_pointmaps = [x[1] for x in per_cam]
@@ -313,13 +298,10 @@ class Evaluator:
             camera_frames.append(camera_frame)
             success_labels.append(has_succeeded)
 
-            # Build policy input batch
-            if self.use_pointmaps:
+            if self.is_articubot:
                 batch = self._build_pointmap_batch(
                     per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
                 )
-            elif self.is_articubot_rgb:
-                batch = self._build_rgb_batch(per_cam_images, pose_set)
             else:
                 per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
                 image_tensor = torch.stack(per_cam_tensors, dim=0).unsqueeze(0).cuda()

@@ -270,7 +270,9 @@ class EpisodicDataset(Dataset):
         self.image_size = 256  # Standard image size
         self.use_plucker = args.use_plucker
         self.num_cameras = args.num_side_cam
-        self.use_pointmaps = args.use_pointmaps
+        # Articubot variants (RoPE4D + RGB-only) share the paired 224 crop
+        # and depth-derived pointmap path; legacy policies keep the 256 path.
+        self.is_articubot = args.policy_class in ('articubot_dit', 'articubot_dit_rgb')
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         
         if not self.args.default_cam:
@@ -412,7 +414,7 @@ class EpisodicDataset(Dataset):
                 cam_pose = pose_from_pos_ori(pos, R)
             self.env.sim.forward()
 
-            if self.use_pointmaps:
+            if self.is_articubot:
                 rgb_img, depth_norm = self.env.sim.render(
                     camera_name="agentview", height=self.image_size,
                     width=self.image_size, depth=True,
@@ -448,7 +450,7 @@ class EpisodicDataset(Dataset):
             else:
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
 
-            if self.use_pointmaps:
+            if self.is_articubot:
                 pointmap_tensor = torch.from_numpy(pointmap_np).float().cuda()
                 # Single joint crop — preserves geometric alignment between
                 # RGB, pointmap, and Plucker channels.
@@ -514,7 +516,7 @@ class EpisodicDataset(Dataset):
             'cam_extrinsics_full': cam_extrinsics_stack,  # (num_cams, 4, 4) c2w
             'cam_intrinsics_full': cam_intrinsics_stack,  # (num_cams, 3, 3)
         }
-        if self.use_pointmaps:
+        if self.is_articubot:
             out['pointmap'] = torch.stack(cam_pointmaps, dim=0)  # (num_cams, 3, H, W)
         return out
 
