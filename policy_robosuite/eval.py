@@ -13,7 +13,7 @@ from cam_embedding import PluckerEmbedder
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv
 from policy_common.paired_crop import adjust_intrinsic
 
 def to_mp4(save_path, image_list, reward_list=None, success_list=None, info_list=None):
@@ -99,10 +99,11 @@ class Evaluator:
         self.plucker_embedder = PluckerEmbedder(img_size=256, device='cuda')
         self.intrinsics = self._get_camera_intrinsics()
 
-        # articubot_dit feeds center-cropped (crop_dst, crop_dst) tensors to the
-        # policy with a correspondingly-adjusted K. Crop constants are static
-        # (center crop), so precompute them once.
+        # articubot_dit{,_rgb} feeds center-cropped (crop_dst, crop_dst) tensors
+        # to the policy. For the RoPE4D variant we also adjust K accordingly.
+        # Crop constants are static (center crop), so precompute them once.
         self.use_pointmaps = bool(getattr(args, 'use_pointmaps', False))
+        self.is_articubot_rgb = getattr(args, 'policy_class', '') == 'articubot_dit_rgb'
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2
         self.crop_left = (self.W - self.crop_dst) // 2
@@ -192,8 +193,10 @@ class Evaluator:
         near = float(self.env.sim.model.vis.map.znear * extent)
         far = float(self.env.sim.model.vis.map.zfar * extent)
         depth_m = mujoco_metric_depth(depth_norm, near, far)
+        # Pose files + mujoco cam_quat are GL convention (camera looks down -Z).
+        # backproject assumes OpenCV (+Z forward), so convert.
         pointmap = backproject(
-            depth_m, self.intrinsics, cam_pose,
+            depth_m, self.intrinsics, c2w_opengl_to_opencv(cam_pose),
             invalid_value=0.0, max_depth=far * 0.99,
         )
         return rgb, pointmap, cam_pose
@@ -209,6 +212,27 @@ class Evaluator:
             else:
                 per_cam_T.append(torch.zeros(4, 4, device='cuda'))
         return torch.stack(per_cam_T, dim=0).unsqueeze(0)
+
+    def _eef_xyz(self):
+        return torch.from_numpy(
+            np.array(self.env.sim.data.site_xpos[
+                self.env.robots[0].eef_site_id[self.env.robots[0].arms[0]]
+            ], dtype=np.float32)
+        ).unsqueeze(0).cuda()
+
+    def _build_rgb_batch(self, per_cam_images, pose_set):
+        """articubot_dit_rgb inference batch. Center-crop 256→crop_dst RGB only."""
+        top, left, dst = self.crop_top, self.crop_left, self.crop_dst
+        imgs = []
+        for rgb_np, cam_pose in zip(per_cam_images, pose_set):
+            plu_pose = None if self.args.default_cam else cam_pose
+            rgb_plu = self._image_to_tensor(rgb_np, plu_pose)  # (9, 256, 256) cpu
+            imgs.append(rgb_plu[:, top:top + dst, left:left + dst])
+        return {
+            'image': torch.stack(imgs, dim=0).unsqueeze(0).cuda(),
+            'eef_xyz': self._eef_xyz(),
+            'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
+        }
 
     def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set):
         """articubot_dit inference batch. Center-crop 256→crop_dst with matching K."""
@@ -230,11 +254,7 @@ class Evaluator:
             'pointmap': torch.stack(pms, dim=0).unsqueeze(0).cuda(),
             'cam_extrinsics_full': torch.stack(extrs, dim=0).unsqueeze(0).cuda(),
             'cam_intrinsics_full': K_crop_t.unsqueeze(0).cuda(),
-            'eef_xyz': torch.from_numpy(
-                np.array(self.env.sim.data.site_xpos[
-                    self.env.robots[0].eef_site_id[self.env.robots[0].arms[0]]
-                ], dtype=np.float32)
-            ).unsqueeze(0).cuda(),
+            'eef_xyz': self._eef_xyz(),
             'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
         }
 
@@ -298,6 +318,8 @@ class Evaluator:
                 batch = self._build_pointmap_batch(
                     per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
                 )
+            elif self.is_articubot_rgb:
+                batch = self._build_rgb_batch(per_cam_images, pose_set)
             else:
                 per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
                 image_tensor = torch.stack(per_cam_tensors, dim=0).unsqueeze(0).cuda()

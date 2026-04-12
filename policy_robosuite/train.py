@@ -20,7 +20,7 @@ from models.smolvla import SmolVLAPolicyWrapper
 import sys as _sys
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 _sys.path.insert(0, _REPO_ROOT)
-from campose_wrappers.articubot_dit import ArticubotDiTWrapper
+from campose_wrappers.articubot_dit import ArticubotDiTWrapper, ArticubotDiTRGBWrapper
 
 import wandb
 
@@ -79,9 +79,13 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
-    elif args.policy_class == 'articubot_dit':
+    elif args.policy_class in ('articubot_dit', 'articubot_dit_rgb'):
         # Robosuite Panda: eef_xyz(3) + qpos(7) = 10-dim state.
-        policy = ArticubotDiTWrapper(
+        wrapper_cls = (
+            ArticubotDiTWrapper if args.policy_class == 'articubot_dit'
+            else ArticubotDiTRGBWrapper
+        )
+        policy = wrapper_cls(
             args=args,
             state_dim=3 + 7,
             action_dim=args.action_dim,
@@ -221,7 +225,7 @@ if __name__ == '__main__':
                         help='Path to camera poses directory (absolute). If None, defaults to policy_robosuite/camera_poses')
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
-    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit'], help='policy class')
+    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit','articubot_dit_rgb'], help='policy class')
     parser.add_argument('--use_pointmaps', default=False, type=str2bool, help='render pointmaps alongside RGB for RoPE4D policies')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')

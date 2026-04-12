@@ -19,7 +19,7 @@ from eval import to_mp4
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 sys.path.insert(0, _REPO_ROOT)
-from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv
 from policy_common.paired_crop import PairedRandomCrop, adjust_intrinsic
 
 # --- Utility Functions ---
@@ -421,8 +421,10 @@ class EpisodicDataset(Dataset):
                 depth_norm = np.flipud(depth_norm).copy()
                 near, far = self._mujoco_near_far()
                 depth_m = mujoco_metric_depth(depth_norm, near, far)
+                # Pose files + mujoco cam_quat are GL convention (camera looks
+                # down -Z). backproject assumes OpenCV (+Z forward), so convert.
                 pointmap_np = backproject(
-                    depth_m, K_base, cam_pose,
+                    depth_m, K_base, c2w_opengl_to_opencv(cam_pose),
                     invalid_value=0.0, max_depth=far * 0.99,
                 )  # (3, H, W) world-frame xyz
             else:
