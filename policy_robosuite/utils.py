@@ -1,6 +1,7 @@
 import h5py
 import torch
 import os
+import sys
 import numpy as np
 import random
 import re
@@ -15,6 +16,11 @@ import torchvision.transforms as T
 from cam_embedding import PluckerEmbedder
 
 from eval import to_mp4
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+sys.path.insert(0, _REPO_ROOT)
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori
+from policy_common.paired_crop import PairedRandomCrop, adjust_intrinsic
 
 # --- Utility Functions ---
 
@@ -264,6 +270,8 @@ class EpisodicDataset(Dataset):
         self.image_size = 256  # Standard image size
         self.use_plucker = args.use_plucker
         self.num_cameras = args.num_side_cam
+        self.use_pointmaps = args.use_pointmaps
+        self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         
         if not self.args.default_cam:
             poses_path = os.path.join(self.args.camera_poses_dir, camera_poses_file)
@@ -351,6 +359,17 @@ class EpisodicDataset(Dataset):
 
         self.env.sim.model.cam_quat[cam_id] = [quat[3], quat[0], quat[1], quat[2]]
     
+    def _mujoco_near_far(self):
+        extent = self.env.sim.model.stat.extent
+        near = self.env.sim.model.vis.map.znear * extent
+        far = self.env.sim.model.vis.map.zfar * extent
+        return float(near), float(far)
+
+    def _get_eef_xyz_world(self):
+        arm = self.env.robots[0].arms[0]
+        site_id = self.env.robots[0].eef_site_id[arm]
+        return np.array(self.env.sim.data.site_xpos[site_id], dtype=np.float32)
+
     def __getitem__(self, demo_idx):
         demo_length = self.demo_lengths[demo_idx]
         states = self.demo_states[demo_idx]
@@ -358,8 +377,17 @@ class EpisodicDataset(Dataset):
         start_ts = np.random.randint(demo_length)
 
         self.env.sim.set_state_from_flattened(states[start_ts])
+        self.env.sim.forward()
+        eef_xyz = self._get_eef_xyz_world()
+
+        # Sample one random crop window and reuse it for all images
+        self._paired_crop.sample_offsets()
 
         cam_images = []
+        cam_pointmaps = []
+        cam_extrinsics_out = []
+        cam_intrinsics_out = []
+
         if not self.args.default_cam:
             start = self.args.m * demo_idx
             end = start + self.args.n
@@ -369,67 +397,124 @@ class EpisodicDataset(Dataset):
         else:
             pose_set = [None] * self.args.num_side_cam
 
+        K_base = self._get_camera_intrinsics()  # (3,3) for the uncropped 256 image
+
         for cam_pose_raw in pose_set:
             if not self.args.default_cam:
-                cam_pose = np.array(cam_pose_raw)
+                cam_pose = np.array(cam_pose_raw, dtype=np.float32)  # c2w (OpenCV/MuJoCo)
                 self._set_camera_pose(cam_pose)
+            else:
+                # Read the current agentview pose directly from MuJoCo.
+                cam_id = self.env.sim.model.camera_name2id("agentview")
+                pos = np.array(self.env.sim.model.cam_pos[cam_id], dtype=np.float32)
+                q = self.env.sim.model.cam_quat[cam_id]  # (w,x,y,z)
+                R = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().astype(np.float32)
+                cam_pose = pose_from_pos_ori(pos, R)
             self.env.sim.forward()
-            rgb_img = self.env.sim.render(camera_name="agentview", height=self.image_size, width=self.image_size, depth=False)
-            rgb_img = np.flipud(rgb_img).copy()
-            rgb_tensor = einops.rearrange(torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w').cuda()
+
+            if self.use_pointmaps:
+                rgb_img, depth_norm = self.env.sim.render(
+                    camera_name="agentview", height=self.image_size,
+                    width=self.image_size, depth=True,
+                )
+                rgb_img = np.flipud(rgb_img).copy()
+                depth_norm = np.flipud(depth_norm).copy()
+                near, far = self._mujoco_near_far()
+                depth_m = mujoco_metric_depth(depth_norm, near, far)
+                pointmap_np = backproject(
+                    depth_m, K_base, cam_pose,
+                    invalid_value=0.0, max_depth=far * 0.99,
+                )  # (3, H, W) world-frame xyz
+            else:
+                rgb_img = self.env.sim.render(
+                    camera_name="agentview", height=self.image_size,
+                    width=self.image_size, depth=False,
+                )
+                rgb_img = np.flipud(rgb_img).copy()
+                pointmap_np = None
+
+            rgb_tensor = einops.rearrange(
+                torch.from_numpy(rgb_img).float() / 255.0, 'h w c -> c h w'
+            ).cuda()
 
             if self.use_plucker and not self.args.default_cam:
-                intrinsics = self._get_camera_intrinsics()
-                intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).float().cuda()
+                intrinsics_tensor = torch.from_numpy(K_base).unsqueeze(0).float().cuda()
                 cam_to_world_tensor = torch.from_numpy(cam_pose).unsqueeze(0).float().cuda()
                 with torch.no_grad():
                     plucker_data = self.plucker_embedder(intrinsics_tensor, cam_to_world_tensor)
                     plucker_tensor = einops.rearrange(plucker_data['plucker'][0], 'h w c -> c h w')
             else:
                 plucker_tensor = torch.zeros(6, rgb_tensor.shape[1], rgb_tensor.shape[2], device='cuda')
-                
-            img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
-            cam_images.append(self.transforms(img_chw))
+
+            if self.use_pointmaps:
+                pointmap_tensor = torch.from_numpy(pointmap_np).float().cuda()
+                # Single joint crop — preserves geometric alignment between
+                # RGB, pointmap, and Plucker channels.
+                rgb_c = self._paired_crop(rgb_tensor)
+                pointmap_c = self._paired_crop(pointmap_tensor)
+                plucker_c = self._paired_crop(plucker_tensor)
+                top, left = self._paired_crop.offsets()
+                K_c = adjust_intrinsic(K_base, top, left)
+
+                img_chw = torch.cat([rgb_c, plucker_c], dim=0)  # (9, dst, dst)
+                cam_images.append(img_chw)
+                cam_pointmaps.append(pointmap_c)
+                cam_extrinsics_out.append(torch.from_numpy(cam_pose).float().cuda())
+                cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
+            else:
+                img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
+                cam_images.append(self.transforms(img_chw))
+                cam_extrinsics_out.append(torch.from_numpy(cam_pose).float().cuda())
+                cam_intrinsics_out.append(torch.from_numpy(K_base).float().cuda())
 
         # Stack per-camera images: [num_cameras, C, H, W]
         image_tensor = torch.stack(cam_images, dim=0)
-        
-        # Camera extrinsics tokens: always 2 entries [2, 4, 4]
+        cam_extrinsics_stack = torch.stack(cam_extrinsics_out, dim=0)  # (num_cams, 4, 4) c2w
+        cam_intrinsics_stack = torch.stack(cam_intrinsics_out, dim=0)  # (num_cams, 3, 3)
+
+        # Legacy "cam_extrinsics" field used by existing policies: always [2, 4, 4]
+        # holding c2w for the first two cameras, zero-padded.
         if self.args.use_cam_pose and not self.args.default_cam:
-            cam_extrinsics_list = []
+            legacy = []
             for i in range(2):
                 if i < len(pose_set) and pose_set[i] is not None:
-                    cam_pose_mat = np.array(pose_set[i], dtype=np.float32)
-                    cam_extrinsics_list.append(torch.from_numpy(cam_pose_mat).float().cuda())
+                    legacy.append(torch.from_numpy(np.array(pose_set[i], dtype=np.float32)).float().cuda())
                 else:
-                    cam_extrinsics_list.append(torch.zeros(4, 4, device='cuda'))
-            cam_extrinsics = torch.stack(cam_extrinsics_list, dim=0)
+                    legacy.append(torch.zeros(4, 4, device='cuda'))
+            cam_extrinsics = torch.stack(legacy, dim=0)
         else:
             cam_extrinsics = torch.zeros(2, 4, 4, device='cuda')
-        
+
         # Normalize and convert to tensors
         robot_qpos = states[start_ts][:7]
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
         actions_seq = actions[start_ts:]
-        
+
         padded_actions = np.zeros((self.max_seq_length, actions.shape[1]), dtype=np.float32)
         seq_length = min(len(actions_seq), self.max_seq_length)
         padded_actions[:seq_length] = actions_seq[:seq_length]
-        
+
         is_pad = np.zeros(self.max_seq_length, dtype=np.bool_)
         is_pad[seq_length:] = True
-        
+
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
-        
-        return {
+
+        out = {
             'image': image_tensor,
-            'qpos': torch.from_numpy(state_normalized).float().cuda(), 
+            'qpos': torch.from_numpy(state_normalized).float().cuda(),
             'actions': torch.from_numpy(actions_normalized).float().cuda(),
             'is_pad': torch.from_numpy(is_pad).cuda(),
-            'cam_extrinsics': cam_extrinsics
+            'cam_extrinsics': cam_extrinsics,
+            # New fields (always emitted; existing policies ignore them)
+            'eef_xyz': torch.from_numpy(eef_xyz).float().cuda(),
+            'cam_extrinsics_full': cam_extrinsics_stack,  # (num_cams, 4, 4) c2w
+            'cam_intrinsics_full': cam_intrinsics_stack,  # (num_cams, 3, 3)
         }
+        if self.use_pointmaps:
+            out['pointmap'] = torch.stack(cam_pointmaps, dim=0)  # (num_cams, 3, H, W)
+        return out
 
     def __del__(self):
         """Close the environment when the dataset is destroyed."""

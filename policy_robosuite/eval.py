@@ -1,4 +1,4 @@
-import os, random, math
+import os, random, math, sys
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -9,6 +9,12 @@ import h5py
 from scipy.spatial.transform import Rotation
 import torchvision.transforms.functional as TF
 from cam_embedding import PluckerEmbedder
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori
+from policy_common.paired_crop import adjust_intrinsic
 
 def to_mp4(save_path, image_list, reward_list=None, success_list=None, info_list=None):
     """
@@ -92,8 +98,16 @@ class Evaluator:
         
         self.plucker_embedder = PluckerEmbedder(img_size=256, device='cuda')
         self.intrinsics = self._get_camera_intrinsics()
-        
-        
+
+        # articubot_dit feeds center-cropped (crop_dst, crop_dst) tensors to the
+        # policy with a correspondingly-adjusted K. Crop constants are static
+        # (center crop), so precompute them once.
+        self.use_pointmaps = bool(getattr(args, 'use_pointmaps', False))
+        self.crop_dst = 224
+        self.crop_top = (self.H - self.crop_dst) // 2
+        self.crop_left = (self.W - self.crop_dst) // 2
+        self.K_crop = adjust_intrinsic(self.intrinsics, self.crop_top, self.crop_left)
+
         camera_poses_dir = args.camera_poses_dir
         self.num_side_cam = int(args.num_side_cam)
         if not args.default_cam:
@@ -157,6 +171,73 @@ class Evaluator:
         img = self.env.sim.render(camera_name="agentview", height=256, width=256, depth=False)
         return np.flipud(img).copy()
 
+    def _render_cam_rgbd(self, cam_pose_raw):
+        """Render RGB + world-frame pointmap at 256x256. Returns (rgb, pointmap, c2w)."""
+        if cam_pose_raw is not None:
+            cam_pose = np.array(cam_pose_raw, dtype=np.float32)
+            self._set_camera_pose(cam_pose)
+        self.env.sim.forward()
+        rgb, depth_norm = self.env.sim.render(
+            camera_name="agentview", height=256, width=256, depth=True,
+        )
+        rgb = np.flipud(rgb).copy()
+        depth_norm = np.flipud(depth_norm).copy()
+        if cam_pose_raw is None:
+            cam_id = self.env.sim.model.camera_name2id("agentview")
+            pos = np.array(self.env.sim.model.cam_pos[cam_id], dtype=np.float32)
+            q = self.env.sim.model.cam_quat[cam_id]  # (w,x,y,z)
+            R = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().astype(np.float32)
+            cam_pose = pose_from_pos_ori(pos, R)
+        extent = self.env.sim.model.stat.extent
+        near = float(self.env.sim.model.vis.map.znear * extent)
+        far = float(self.env.sim.model.vis.map.zfar * extent)
+        depth_m = mujoco_metric_depth(depth_norm, near, far)
+        pointmap = backproject(
+            depth_m, self.intrinsics, cam_pose,
+            invalid_value=0.0, max_depth=far * 0.99,
+        )
+        return rgb, pointmap, cam_pose
+
+    def _legacy_cam_extrinsics(self, pose_set):
+        """Build the [1, 2, 4, 4] cam_extrinsics field ACT/DP/SmolVLA expect."""
+        if not (self.args.use_cam_pose and not self.args.default_cam):
+            return torch.zeros(1, 2, 4, 4, device='cuda')
+        per_cam_T = []
+        for i in range(2):
+            if i < len(pose_set) and pose_set[i] is not None:
+                per_cam_T.append(torch.from_numpy(np.array(pose_set[i], dtype=np.float32)).float().cuda())
+            else:
+                per_cam_T.append(torch.zeros(4, 4, device='cuda'))
+        return torch.stack(per_cam_T, dim=0).unsqueeze(0)
+
+    def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set):
+        """articubot_dit inference batch. Center-crop 256→crop_dst with matching K."""
+        top, left, dst = self.crop_top, self.crop_left, self.crop_dst
+        imgs, pms, extrs = [], [], []
+        for rgb_np, pm_np, cam_pose in zip(per_cam_rgb, per_cam_pointmaps, per_cam_poses):
+            # rgb | plucker tensor built by the existing helper (no crop).
+            # Zero plucker in default_cam mode to match training.
+            plu_pose = None if self.args.default_cam else cam_pose
+            rgb_plu = self._image_to_tensor(rgb_np, plu_pose)  # (9, 256, 256) cpu
+            pm_t = torch.from_numpy(pm_np).float()             # (3, 256, 256) cpu
+            imgs.append(rgb_plu[:, top:top + dst, left:left + dst])
+            pms.append(pm_t[:, top:top + dst, left:left + dst])
+            extrs.append(torch.from_numpy(cam_pose).float())
+        n = len(imgs)
+        K_crop_t = torch.from_numpy(self.K_crop).float().unsqueeze(0).expand(n, -1, -1)
+        return {
+            'image': torch.stack(imgs, dim=0).unsqueeze(0).cuda(),
+            'pointmap': torch.stack(pms, dim=0).unsqueeze(0).cuda(),
+            'cam_extrinsics_full': torch.stack(extrs, dim=0).unsqueeze(0).cuda(),
+            'cam_intrinsics_full': K_crop_t.unsqueeze(0).cuda(),
+            'eef_xyz': torch.from_numpy(
+                np.array(self.env.sim.data.site_xpos[
+                    self.env.robots[0].eef_site_id[self.env.robots[0].arms[0]]
+                ], dtype=np.float32)
+            ).unsqueeze(0).cuda(),
+            'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
+        }
+
     def _image_to_tensor(self, cam_img, cam_pose_raw):
         rgb_tensor = einops.rearrange(torch.from_numpy(cam_img).float() / 255.0, 'h w c -> c h w')
         if self.args.use_plucker and cam_pose_raw is not None:
@@ -198,35 +279,42 @@ class Evaluator:
                 pose_set = [poses_list[2 * episode_num], poses_list[2 * episode_num + 1]]
         
         while not done and step < self.max_steps:
-            per_cam_images = [self._render_cam_image(p) for p in pose_set]
+            if self.use_pointmaps:
+                per_cam = [self._render_cam_rgbd(p) for p in pose_set]
+                per_cam_images = [x[0] for x in per_cam]
+                per_cam_pointmaps = [x[1] for x in per_cam]
+                per_cam_poses = [x[2] for x in per_cam]
+            else:
+                per_cam_images = [self._render_cam_image(p) for p in pose_set]
+                per_cam_pointmaps = None
+                per_cam_poses = None
+
             camera_frame = per_cam_images[0] if len(per_cam_images) == 1 else np.concatenate([per_cam_images[0], per_cam_images[1]], axis=1)
             camera_frames.append(camera_frame)
             success_labels.append(has_succeeded)
 
-            # Build model input [1, num_cameras, C, H, W]
-            per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
-            image_tensor = torch.stack(per_cam_tensors, dim=0).unsqueeze(0).cuda()
-
-            # Camera extrinsics: always two entries, shape [1, 2, 4, 4]
-            if self.args.use_cam_pose and not self.args.default_cam:
-                per_cam_T = []
-                for i in range(2):
-                    if i < len(pose_set) and pose_set[i] is not None:
-                        per_cam_T.append(torch.from_numpy(np.array(pose_set[i], dtype=np.float32)).float().cuda())
-                    else:
-                        per_cam_T.append(torch.zeros(4, 4, device='cuda'))
-                cam_extrinsics = torch.stack(per_cam_T, dim=0).unsqueeze(0)
+            # Build policy input batch
+            if self.use_pointmaps:
+                batch = self._build_pointmap_batch(
+                    per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
+                )
             else:
-                cam_extrinsics = torch.zeros(1, 2, 4, 4, device='cuda')
-            
+                per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
+                image_tensor = torch.stack(per_cam_tensors, dim=0).unsqueeze(0).cuda()
+                batch = {
+                    'image': image_tensor,
+                    'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
+                }
+
             state_vector = self.env.sim.data.qpos[:7]
             if np.random.rand() < self.args.prob_drop_proprio:
                 state_vector = np.zeros_like(state_vector)
             normalized_state = (state_vector - self.norm_stats["state_mean"].cpu().numpy()) / self.norm_stats["state_std"].cpu().numpy()
             state_tensor = einops.rearrange(torch.tensor(normalized_state, device="cuda").float(), 'd -> 1 d')
-            
+            batch['qpos'] = state_tensor
+
             with torch.no_grad(), (torch.autocast("cuda", dtype=torch.bfloat16) if self.args.use_fp16 else nullcontext()):
-                action_chunk = policy({'qpos': state_tensor, 'image': image_tensor, 'cam_extrinsics': cam_extrinsics})
+                action_chunk = policy(batch)
             action_chunk = action_chunk[0].float().cpu().numpy() * self.norm_stats["action_std"].cpu().numpy() + self.norm_stats["action_mean"].cpu().numpy()
             
             # Execute action chunk

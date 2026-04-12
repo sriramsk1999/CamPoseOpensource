@@ -17,6 +17,11 @@ from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
 
+import sys as _sys
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_sys.path.insert(0, _REPO_ROOT)
+from campose_wrappers.articubot_dit import ArticubotDiTWrapper
+
 import wandb
 
 torch.backends.cuda.enable_flash_sdp(True)
@@ -74,6 +79,16 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
+    elif args.policy_class == 'articubot_dit':
+        # Robosuite Panda: eef_xyz(3) + qpos(7) = 10-dim state.
+        policy = ArticubotDiTWrapper(
+            args=args,
+            state_dim=3 + 7,
+            action_dim=args.action_dim,
+            num_cams=args.num_side_cam,
+            image_size=224,
+            norm_stats=stats,
+        ).cuda()
     
     optimizer = policy.configure_optimizers()
     if args.policy_class == 'smolvla':
@@ -156,9 +171,9 @@ def main(args, ckpt=None):
             }, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
-            if time.time() - start_time > 7.5 * 60 * 60:
-                print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
-                break
+            # if time.time() - start_time > 7.5 * 60 * 60:
+            #     print(f"⏰ Time limit reached ({(time.time() - start_time)/3600:.1f} hours). Exiting...")
+            #     break
 
         # Check OpenGL framebuffer. This is a hack to fix the renderer issue in robosuite.
         if gl.GL_FRAMEBUFFER_COMPLETE != gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER):
@@ -206,7 +221,10 @@ if __name__ == '__main__':
                         help='Path to camera poses directory (absolute). If None, defaults to policy_robosuite/camera_poses')
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
-    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla'], help='policy class')
+    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit'], help='policy class')
+    parser.add_argument('--use_pointmaps', default=False, type=str2bool, help='render pointmaps alongside RGB for RoPE4D policies')
+    parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
+    parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
@@ -226,7 +244,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_epochs', default=30_001, type=int, help='num_epochs')
     parser.add_argument('--eval_start_epoch', type=int, default=20_000, help='start evaluating 50 at this epoch')
     parser.add_argument('--lr', type=float, default=2e-5, help='lr')
-    parser.add_argument('--save_every', type=int, default=1000, help='save checkpoint every N epochs')
+    parser.add_argument('--save_every', type=int, default=10000, help='save checkpoint every N epochs')
     parser.add_argument('--use_fp16', default=True, type=str2bool, help='use mixed precision bf16 training')
     
     # Dataloader config
@@ -295,13 +313,11 @@ if __name__ == '__main__':
     # Check for existing checkpoint to resume
     ckpt_path = get_last_ckpt(args.ckpt_dir)
     
+    wandb.init(project='CamPose_training', name=args.name, config=vars(args), group=group)
     if ckpt_path is not None:
         print(f"Resuming from checkpoint: {ckpt_path}")
         ckpt = torch.load(ckpt_path)
-        wandb_id = ckpt['wandb_id']
-        wandb.init(project='test', id=wandb_id, resume='must', group=group)
         main(args, ckpt)
     else:
         print(f"Starting new training run: {args.name}")
-        wandb.init(project='test', name=args.name, config=vars(args), group=group)
         main(args)

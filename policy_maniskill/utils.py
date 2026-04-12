@@ -1,6 +1,7 @@
 import h5py
 import torch
 import os
+import sys
 import numpy as np
 import random
 import re
@@ -16,6 +17,10 @@ from cam_embedding import PluckerEmbedder
 from mani_skill.trajectory.utils import dict_to_list_of_dicts
 
 from eval import to_mp4
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+sys.path.insert(0, _REPO_ROOT)
+from policy_common.paired_crop import PairedRandomCrop, adjust_intrinsic
 
 # --- Utility Functions ---
 
@@ -244,6 +249,8 @@ class EpisodicDataset(Dataset):
         self.args = args
         self.image_size = 256
         self.use_plucker = args.use_plucker
+        self.use_pointmaps = args.use_pointmaps
+        self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         self.env = env
 
         if self.use_plucker:
@@ -292,6 +299,40 @@ class EpisodicDataset(Dataset):
     def __len__(self):
         return len(self.demo_indices)
 
+    def _get_eef_xyz_world(self):
+        tcp_pos = self.env.unwrapped.agent.tcp_pos  # (num_envs, 3) tensor
+        if hasattr(tcp_pos, 'detach'):
+            tcp_pos = tcp_pos.detach().cpu().numpy()
+        return np.asarray(tcp_pos, dtype=np.float32).reshape(-1)[:3]
+
+    def _pointmap_from_position_texture(self, position_texture, cam2world_gl):
+        """Convert SAPIEN camera-frame position texture to world-frame (3,H,W).
+
+        position_texture: (H, W, 3) tensor in GL camera frame.
+          - float dtype: meters
+          - int16 dtype: millimeters (minimal shader)
+        cam2world_gl: (4, 4) numpy array (GL model matrix).
+        Returns (3, H, W) float32 numpy in world frame.
+        """
+        if hasattr(position_texture, 'detach'):
+            pos = position_texture.detach().cpu().numpy()
+        else:
+            pos = np.asarray(position_texture)
+        if pos.dtype == np.int16:
+            pos = pos.astype(np.float32) * 0.001
+        else:
+            pos = pos.astype(np.float32)
+        H, W, _ = pos.shape
+        # Invalid pixels: SAPIEN writes (0,0,0) for no-hit / sky.
+        invalid = np.all(pos == 0.0, axis=-1)  # (H, W)
+        cam2world_gl = np.asarray(cam2world_gl, dtype=np.float32)
+        ones = np.ones((H, W, 1), dtype=np.float32)
+        pts_h = np.concatenate([pos, ones], axis=-1)  # (H, W, 4)
+        pts_world = pts_h @ cam2world_gl.T  # (H, W, 4)
+        pts_world = pts_world[..., :3]
+        pts_world[invalid] = 0.0
+        return pts_world.transpose(2, 0, 1).astype(np.float32)  # (3, H, W)
+
     def __getitem__(self, index):
         demo_idx = index
         demo_length = self.demo_lengths[demo_idx]
@@ -301,6 +342,9 @@ class EpisodicDataset(Dataset):
 
         # Set env state
         self.env.unwrapped.set_state_dict(states[start_ts])
+
+        eef_xyz = self._get_eef_xyz_world()
+        self._paired_crop.sample_offsets()
 
         if self.args.default_cam:
             cam_names = ["render_camera" for _ in range(self.args.num_side_cam)]
@@ -312,26 +356,89 @@ class EpisodicDataset(Dataset):
             cam_names = [f"cam_{i}" for i in chosen.tolist()]
 
         cam_images = []
+        cam_pointmaps = []
+        cam_extrinsics_out = []
+        cam_intrinsics_out = []
+
+        # Update render so capture() returns current state.
+        self.env.unwrapped.scene.update_render(
+            update_sensors=False, update_human_render_cameras=True,
+        )
+
         for cam_name in cam_names:
-            obs = self.env.unwrapped.render_rgb_array(cam_name)
-            rgb = obs.permute(0, 3, 1, 2).float() / 255.0
-            rgb = rgb[0]
+            camera = self.env.unwrapped.scene.human_render_cameras[cam_name]
+            params = camera.get_params()
+            # get_params values can be batched (num_envs, ...); squeeze first.
+            K_np = np.asarray(params["intrinsic_cv"], dtype=np.float32)
+            if K_np.ndim == 3:
+                K_np = K_np[0]
+            cam2world_gl_np = np.asarray(params["cam2world_gl"], dtype=np.float32)
+            if cam2world_gl_np.ndim == 3:
+                cam2world_gl_np = cam2world_gl_np[0]
+
+            if self.use_pointmaps:
+                camera.capture()
+                obs_dict = camera.get_obs(
+                    rgb=True, depth=False, position=True,
+                    segmentation=False, normal=False, albedo=False,
+                )
+                rgb_raw = obs_dict["rgb"]  # (1, H, W, 3 or 4) uint8 or float
+                if hasattr(rgb_raw, 'detach'):
+                    rgb_raw = rgb_raw.detach().cpu().numpy()
+                if rgb_raw.ndim == 4:
+                    rgb_raw = rgb_raw[0]
+                rgb_np = rgb_raw[..., :3]
+                if rgb_np.dtype != np.float32:
+                    rgb_np = rgb_np.astype(np.float32) / 255.0
+                rgb_tensor = einops.rearrange(
+                    torch.from_numpy(np.ascontiguousarray(rgb_np)), 'h w c -> c h w'
+                ).float().cuda()
+
+                position_texture = obs_dict["position"]
+                if position_texture.ndim == 4:
+                    position_texture = position_texture[0]
+                pointmap_np = self._pointmap_from_position_texture(
+                    position_texture, cam2world_gl_np,
+                )
+            else:
+                obs = self.env.unwrapped.render_rgb_array(cam_name)
+                rgb_tensor = (obs.permute(0, 3, 1, 2).float() / 255.0)[0]
+                pointmap_np = None
 
             if self.use_plucker:
-                camera = self.env.unwrapped.scene.human_render_cameras[cam_name]
-                intrinsics = camera.get_params()["intrinsic_cv"]
-                cam2world = camera.get_params()["cam2world_gl"]
-                pl = self.plucker_embedder(intrinsics, cam2world)["plucker"][0]
-                pl = einops.rearrange(pl, 'h w c -> c h w')
+                pl = self.plucker_embedder(K_np, cam2world_gl_np)["plucker"][0]
+                plucker_tensor = einops.rearrange(pl, 'h w c -> c h w')
             else:
-                _, H, W = rgb.shape
-                pl = torch.zeros(6, H, W, device=rgb.device)
+                _, H, W = rgb_tensor.shape
+                plucker_tensor = torch.zeros(6, H, W, device=rgb_tensor.device)
 
-            img_chw = torch.cat([rgb, pl], dim=0)
-            cam_images.append(self.transforms(img_chw))
+            if self.use_pointmaps:
+                pointmap_tensor = torch.from_numpy(pointmap_np).float().cuda()
+                rgb_c = self._paired_crop(rgb_tensor)
+                pointmap_c = self._paired_crop(pointmap_tensor)
+                plucker_c = self._paired_crop(plucker_tensor)
+                top, left = self._paired_crop.offsets()
+                K_c = adjust_intrinsic(K_np, top, left)
+
+                img_chw = torch.cat([rgb_c, plucker_c], dim=0)  # (9, dst, dst)
+                cam_images.append(img_chw)
+                cam_pointmaps.append(pointmap_c)
+                cam_extrinsics_out.append(
+                    torch.from_numpy(cam2world_gl_np).float().cuda()
+                )
+                cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
+            else:
+                img_chw = torch.cat([rgb_tensor, plucker_tensor], dim=0)
+                cam_images.append(self.transforms(img_chw))
+                cam_extrinsics_out.append(
+                    torch.from_numpy(cam2world_gl_np).float().cuda()
+                )
+                cam_intrinsics_out.append(torch.from_numpy(K_np).float().cuda())
 
         # Stack per-camera images: [num_cameras, C, H, W]
         image_tensor = torch.stack(cam_images, dim=0)
+        cam_extrinsics_stack = torch.stack(cam_extrinsics_out, dim=0)
+        cam_intrinsics_stack = torch.stack(cam_intrinsics_out, dim=0)
 
         # qpos extraction
         st = states[start_ts]
@@ -355,12 +462,18 @@ class EpisodicDataset(Dataset):
         state_normalized = (robot_qpos - self.norm_stats["state_mean"]) / self.norm_stats["state_std"]
         actions_normalized = (padded_actions - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
 
-        return {
+        out = {
             'image': image_tensor,
             'qpos': torch.from_numpy(state_normalized).float().cuda(),
             'actions': torch.from_numpy(actions_normalized).float().cuda(),
-            'is_pad': torch.from_numpy(is_pad).cuda()
+            'is_pad': torch.from_numpy(is_pad).cuda(),
+            'eef_xyz': torch.from_numpy(eef_xyz).float().cuda(),
+            'cam_extrinsics_full': cam_extrinsics_stack,  # (num_cams, 4, 4) c2w (GL)
+            'cam_intrinsics_full': cam_intrinsics_stack,  # (num_cams, 3, 3)
         }
+        if self.use_pointmaps:
+            out['pointmap'] = torch.stack(cam_pointmaps, dim=0)  # (num_cams, 3, H, W)
+        return out
 
 # --- Data Loading Function ---
 
