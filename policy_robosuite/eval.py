@@ -102,7 +102,12 @@ class Evaluator:
         # articubot_dit{,_rgb} feeds center-cropped (crop_dst, crop_dst) tensors
         # to the policy and additionally consumes depth-derived pointmaps.
         # Crop constants are static (center crop), so precompute them once.
-        self.is_articubot = getattr(args, 'policy_class', '') in ('articubot_dit', 'articubot_dit_rgb')
+        # Single DINO/paired-crop codepath shared by articubot DiT variants and
+        # act_dino: center-crop 256→224, adjust K, emit pointmap. act_dino
+        # simply ignores the pointmap field.
+        self.is_dino = getattr(args, 'policy_class', '') in (
+            'articubot_dit', 'articubot_dit_rgb', 'act_dino'
+        )
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2
         self.crop_left = (self.W - self.crop_dst) // 2
@@ -284,7 +289,7 @@ class Evaluator:
                 pose_set = [poses_list[2 * episode_num], poses_list[2 * episode_num + 1]]
         
         while not done and step < self.max_steps:
-            if self.is_articubot:
+            if self.is_dino:
                 per_cam = [self._render_cam_rgbd(p) for p in pose_set]
                 per_cam_images = [x[0] for x in per_cam]
                 per_cam_pointmaps = [x[1] for x in per_cam]
@@ -298,7 +303,7 @@ class Evaluator:
             camera_frames.append(camera_frame)
             success_labels.append(has_succeeded)
 
-            if self.is_articubot:
+            if self.is_dino:
                 batch = self._build_pointmap_batch(
                     per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
                 )

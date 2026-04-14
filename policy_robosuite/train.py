@@ -13,6 +13,7 @@ from pathlib import Path
 
 from utils import load_data, compute_dict_mean, set_seed, detach_dict, constant_schedule, cleanup_ckpt, get_last_ckpt, cosine_schedule_with_warmup
 from models.act import ACTPolicy
+from models.act_dino import ACTDinoPolicy
 from eval import Evaluator
 from models.dp import DiffusionPolicy
 from models.smolvla import SmolVLAPolicyWrapper
@@ -75,6 +76,8 @@ def main(args, ckpt=None):
 
     if args.policy_class == 'act':
         policy = ACTPolicy(args).cuda()
+    elif args.policy_class == 'act_dino':
+        policy = ACTDinoPolicy(args).cuda()
     elif args.policy_class == 'dp':
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
@@ -225,7 +228,7 @@ if __name__ == '__main__':
                         help='Path to camera poses directory (absolute). If None, defaults to policy_robosuite/camera_poses')
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
-    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit','articubot_dit_rgb'], help='policy class')
+    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit','articubot_dit_rgb', 'act_dino'], help='policy class')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 
@@ -245,7 +248,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', default=70, type=int, help='batch_size')
     parser.add_argument('--seed', default=0, type=int, help='seed')
     parser.add_argument('--num_epochs', default=30_001, type=int, help='num_epochs')
-    parser.add_argument('--eval_start_epoch', type=int, default=20_000, help='start evaluating 50 at this epoch')
+    parser.add_argument('--eval_start_epoch', type=int, default=1_000, help='start evaluating 50 at this epoch')
     parser.add_argument('--lr', type=float, default=2e-5, help='lr')
     parser.add_argument('--save_every', type=int, default=10000, help='save checkpoint every N epochs')
     parser.add_argument('--use_fp16', default=True, type=str2bool, help='use mixed precision bf16 training')
@@ -274,6 +277,14 @@ if __name__ == '__main__':
     parser.add_argument('--dec_layers', type=int, default=7, help='number of decoder layers')
     parser.add_argument('--pre_norm', type=bool, default=True, help='use pre-normalization')
     parser.add_argument('--activation', default='relu', help='activation function')
+
+    # act_dino model config
+    parser.add_argument('--dino_backbone', type=str, default='vitb', choices=['vits', 'vitb', 'vitl'],
+                        help='DINOv2 backbone size for act_dino')
+    parser.add_argument('--dino_pretrained', default=True, type=str2bool,
+                        help='load pretrained DINOv2 weights for act_dino')
+    parser.add_argument('--dino_camera_enc', default=False, type=str2bool,
+                        help='enable CameraEnc (geometry-aware camera tokens) in act_dino backbone')
 
     # Backbone config
     parser.add_argument('--backbone', default='late_imagenet', help='backbone: resnet, linear')

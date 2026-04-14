@@ -68,6 +68,24 @@ _DIFFUSION_MODEL_CFG = {
     "num_layers": 12,
 }
 
+# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview.yaml.
+# The encoder's __init__ defaults are 4 but the shipping YAML overrides to 6,
+# and its ``visual_encoder_cfg={}`` path would otherwise fall back to 4.
+_DINO_CROSSVIEW_CFG = {
+    "backbone": "vitb",
+    "pretrained": True,
+    "alt_start": 6,
+    "qknorm_start": 6,
+    "rope_start": 6,
+    "cat_token": True,
+    "camera_noise_cfg": {
+        "translation_std": 0.01,
+        "rotation_deg_std": 1.5,
+        "focal_rel_std": 0.015,
+        "principal_point_px_std": 3.0,
+    },
+}
+
 
 class _ArticubotWrapperBase(nn.Module):
     """Shared CamPose→ArticuBot batch adaptation + flow-matching loss.
@@ -239,7 +257,7 @@ class ArticubotDiTWrapper(_ArticubotWrapperBase):
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
             visual_encoder_type="dino_crossview",
-            visual_encoder_cfg={},
+            visual_encoder_cfg=dict(_DINO_CROSSVIEW_CFG),
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
@@ -295,7 +313,7 @@ class ArticubotDiTRGBWrapper(_ArticubotWrapperBase):
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
             visual_encoder_type="dino_crossview",
-            visual_encoder_cfg={},
+            visual_encoder_cfg=dict(_DINO_CROSSVIEW_CFG),
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
