@@ -21,6 +21,67 @@ from .transformer import (
 )
 
 
+class PluckerViT(nn.Module):
+    """Small ViT trained from scratch over 6-channel Plucker ray maps.
+
+    Patchifies with the same 14x14 stride as DINOv2 so output tokens align
+    1:1 with ``DinoCrossViewTokenEncoder`` patch tokens, which makes a
+    token-wise late concat trivial.
+    """
+
+    def __init__(
+        self,
+        crop_shape=(224, 224),
+        patch_size: int = 14,
+        embed_dim: int = 384,
+        depth: int = 4,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        crop_h, crop_w = crop_shape
+        assert crop_h % patch_size == 0 and crop_w % patch_size == 0
+        self.crop_h = crop_h
+        self.crop_w = crop_w
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.num_patches = (crop_h // patch_size) * (crop_w // patch_size)
+
+        self.patch_embed = nn.Conv2d(
+            6, embed_dim, kernel_size=patch_size, stride=patch_size,
+        )
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=embed_dim,
+                    nhead=num_heads,
+                    dim_feedforward=int(embed_dim * mlp_ratio),
+                    dropout=0.0,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, plucker):
+        """plucker: (B, num_cam, 6, H, W) -> (B, num_cam, num_patches, embed_dim)"""
+        b, s = plucker.shape[:2]
+        x = rearrange(plucker, "b s c h w -> (b s) c h w")
+        x = self.patch_embed(x)
+        x = rearrange(x, "bs d h w -> bs (h w) d")
+        x = x + self.pos_embed
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.norm(x)
+        return rearrange(x, "(b s) n d -> b s n d", b=b, s=s)
+
+
 def _ensure_articubot_on_path():
     path = os.environ.get("ARTICUBOT_DP") or os.path.expanduser(
         "~/Desktop/ArticuBot/diffusion_policy"
@@ -54,6 +115,11 @@ class BackboneDinoCrossView(nn.Module):
         cat_token: bool = True,
         include_camera_enc: bool = True,
         max_cams: int = 4,
+        use_plucker: bool = False,
+        plucker_vit_embed_dim: int = 384,
+        plucker_vit_depth: int = 4,
+        plucker_vit_num_heads: int = 6,
+        plucker_vit_mlp_ratio: float = 4.0,
     ):
         super().__init__()
         _ensure_articubot_on_path()
@@ -81,6 +147,24 @@ class BackboneDinoCrossView(nn.Module):
         self.num_tokens_per_cam = self.encoder.num_tokens
         self.num_channels = hidden_dim
         self.include_camera_enc = include_camera_enc
+        self.use_plucker = use_plucker
+
+        if use_plucker:
+            self.plucker_vit = PluckerViT(
+                crop_shape=crop_shape,
+                patch_size=14,
+                embed_dim=plucker_vit_embed_dim,
+                depth=plucker_vit_depth,
+                num_heads=plucker_vit_num_heads,
+                mlp_ratio=plucker_vit_mlp_ratio,
+            )
+            assert self.plucker_vit.num_patches == self.num_tokens_per_cam, (
+                f"PluckerViT patch count {self.plucker_vit.num_patches} must match "
+                f"DINO token count {self.num_tokens_per_cam}"
+            )
+            self.fused_projector = nn.Linear(
+                self.encoder.token_dim + plucker_vit_embed_dim, hidden_dim,
+            )
 
         self.pos_embed = nn.Embedding(max_cams * self.num_tokens_per_cam, hidden_dim)
         nn.init.normal_(self.pos_embed.weight, std=0.02)
@@ -89,7 +173,8 @@ class BackboneDinoCrossView(nn.Module):
         """
         Args:
             images:     (B, num_cam, C, H, W) — RGB (+optional Plucker) in [0, 1].
-                         Only the first 3 (RGB) channels are consumed.
+                         Channels [0:3] are RGB, [3:9] Plucker rays when
+                         ``use_plucker`` is set.
             extrinsics: (B, num_cam, 4, 4) c2w (optional).
             intrinsics: (B, num_cam, 3, 3)       (optional).
         Returns:
@@ -114,7 +199,18 @@ class BackboneDinoCrossView(nn.Module):
             intr = intrinsics
 
         tokens = self.encoder(rgb, extrinsics=w2c, intrinsics=intr)
-        tokens = self.encoder.projector(tokens)  # (B, num_cam, N_tok, hidden_dim)
+
+        if self.use_plucker:
+            assert images.size(2) == 9, (
+                f"use_plucker expects 9-channel images (3 RGB + 6 Plucker), "
+                f"got {images.size(2)}"
+            )
+            plucker = images[:, :, 3:9]
+            plucker_tokens = self.plucker_vit(plucker)  # (B, S, N_tok, plk_dim)
+            fused = torch.cat([tokens, plucker_tokens], dim=-1)
+            tokens = self.fused_projector(fused)  # (B, S, N_tok, hidden_dim)
+        else:
+            tokens = self.encoder.projector(tokens)  # (B, S, N_tok, hidden_dim)
 
         features = rearrange(tokens, "b s n d -> b (s n) d")
         total_len = features.shape[1]
@@ -233,6 +329,11 @@ def build_dino(args):
         cat_token=getattr(args, "dino_cat_token", True),
         include_camera_enc=getattr(args, "dino_camera_enc", True),
         max_cams=max(2, getattr(args, "num_side_cam", 2)),
+        use_plucker=getattr(args, "use_plucker", False),
+        plucker_vit_embed_dim=getattr(args, "plucker_vit_embed_dim", 384),
+        plucker_vit_depth=getattr(args, "plucker_vit_depth", 4),
+        plucker_vit_num_heads=getattr(args, "plucker_vit_num_heads", 6),
+        plucker_vit_mlp_ratio=getattr(args, "plucker_vit_mlp_ratio", 4.0),
     )
 
     transformer = Transformer(
