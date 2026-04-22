@@ -233,7 +233,7 @@ if __name__ == '__main__':
     parser.add_argument('--transform', type=str, default='crop', choices=['crop', 'id', 'crop_jitter'], 
                         help='Image transformation type')
     parser.add_argument('--prob_drop_proprio', default=1., type=float, help='probability to drop proprio')
-    parser.add_argument('--use_cam_pose', default=True, type=bool, help='otherwise mask to 0')
+    parser.add_argument('--use_cam_pose', default=False, type=str2bool, help='otherwise mask to 0')
     parser.add_argument('--original', default=False, type=str2bool, help='visually same as original lift')
 
 

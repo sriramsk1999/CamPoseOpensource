@@ -18,7 +18,7 @@ python -m pip install --upgrade pip setuptools wheel
 
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-pip install numpy scipy h5py einops pillow tqdm imageio imageio-ffmpeg PyOpenGL glfw wandb
+pip install numpy scipy h5py einops pillow tqdm imageio imageio-ffmpeg PyOpenGL glfw wandb pyyaml
 
 pip install diffusers transformers
 

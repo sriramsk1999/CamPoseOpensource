@@ -1,0 +1,1011 @@
+experiments:
+  robosuite_act_lift_fixed_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      original: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_fixed_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      use_plucker: 1
+      original: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_randomized_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_randomized_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_can_fixed_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_can_fixed_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_can_randomized_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_can_randomized_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_fixed_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_fixed_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_randomized_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_randomized_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+
+  robosuite_act_lift_no_crop_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      transform: id
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_no_crop_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      transform: id
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_can_no_crop_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      transform: id
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_can_no_crop_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      transform: id
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_no_crop_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      transform: id
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_no_crop_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      transform: id
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+
+  robosuite_act_lift_absolute_eef_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_eef_abs
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_absolute_eef_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_eef_abs
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_delta_joint_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_joint_delta
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_delta_joint_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_joint_delta
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_absolute_joint_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_joint_abs
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_absolute_joint_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: liftrand_joint_abs
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+
+  robosuite_act_lift_vector:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: resnet_imagenet
+      use_cam_pose: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_can_vector:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      backbone: resnet_imagenet
+      use_cam_pose: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_vector:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      backbone: resnet_imagenet
+      use_cam_pose: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_lift_early_concat:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: resnet_imagenet
+      use_cam_pose: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_can_early_concat:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      backbone: resnet_imagenet
+      use_cam_pose: 0
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_act_square_early_concat:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      backbone: resnet_imagenet
+      use_cam_pose: 0
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+
+  robosuite_act_lift_no_pretrain_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: resnet
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_no_pretrain_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: resnet
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_r3m_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: late_r3m
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_r3m_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      backbone: late_r3m
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+
+  robosuite_act_lift_scaling_n10_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 10
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n10_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 10
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n22_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 22
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n22_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 22
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n45_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 45
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n45_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 45
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n100_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 100
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n100_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 100
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n215_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 215
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n215_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 215
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n445_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 445
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n445_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 445
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n1000_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 1000
+      m: 0
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+  robosuite_act_lift_scaling_n1000_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      n: 1000
+      m: 0
+      use_plucker: 1
+      num_epochs: 20001
+      eval_start_epoch: 10000
+      eval_max_steps: 150
+
+  robosuite_dp_lift_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+  robosuite_dp_lift_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      use_plucker: 1
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+  robosuite_dp_can_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+  robosuite_dp_can_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+  robosuite_dp_square_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+  robosuite_dp_square_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 100001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 600
+
+  robosuite_smolvla_lift_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  robosuite_smolvla_lift_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  robosuite_smolvla_can_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_smolvla_can_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      dataset_suffix: canrand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_smolvla_square_image_only:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+  robosuite_smolvla_square_with_conditioning:
+    entrypoint: policy_robosuite/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      dataset_suffix: squarerand_eef_delta
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 600
+
+  maniskill_act_push_fixed_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      use_plucker: 0
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_push_fixed_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_push_randomized_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_push_randomized_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_lift_upright_fixed_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: lift_rand
+      use_plucker: 0
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_act_lift_upright_fixed_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: lift_rand
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_act_lift_upright_randomized_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: lift_rand
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_act_lift_upright_randomized_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: lift_rand
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_act_roll_ball_fixed_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 0
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_roll_ball_fixed_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      original: 1
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_roll_ball_randomized_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_act_roll_ball_randomized_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+
+  maniskill_dp_push_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      use_plucker: 0
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 150
+  maniskill_dp_push_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 150
+  maniskill_dp_lift_upright_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: lift_rand
+      use_plucker: 0
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 450
+  maniskill_dp_lift_upright_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: lift_rand
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 450
+  maniskill_dp_roll_ball_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: roll_rand
+      use_plucker: 0
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 150
+  maniskill_dp_roll_ball_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0, 1, 2]
+    overrides:
+      policy_class: dp
+      dataset_suffix: roll_rand
+      num_epochs: 80001
+      eval_start_epoch: 60000
+      eval_every: 2000
+      eval_max_steps: 150
+
+  maniskill_smolvla_push_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      lr_scheduler: cosine
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_smolvla_push_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      lr_scheduler: cosine
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_smolvla_lift_upright_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      lr_scheduler: cosine
+      dataset_suffix: lift_rand
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_smolvla_lift_upright_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      lr_scheduler: cosine
+      dataset_suffix: lift_rand
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 450
+  maniskill_smolvla_roll_ball_image_only:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      lr_scheduler: cosine
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      use_plucker: 0
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+  maniskill_smolvla_roll_ball_with_conditioning:
+    entrypoint: policy_maniskill/train.py
+    seeds: [0]
+    overrides:
+      policy_class: smolvla
+      batch_size: 30
+      lr_scheduler: cosine
+      dataset_suffix: roll_rand
+      num_side_cam: 2
+      n: 4
+      m: 2
+      num_epochs: 30001
+      eval_start_epoch: 20000
+      eval_max_steps: 150
+
+paper_items:
+  fig6:
+    lift_fixed_image_only: robosuite_act_lift_fixed_image_only
+    lift_fixed_with_conditioning: robosuite_act_lift_fixed_with_conditioning
+    lift_randomized_image_only: robosuite_act_lift_randomized_image_only
+    lift_randomized_with_conditioning: robosuite_act_lift_randomized_with_conditioning
+    pick_place_can_fixed_image_only: robosuite_act_can_fixed_image_only
+    pick_place_can_fixed_with_conditioning: robosuite_act_can_fixed_with_conditioning
+    pick_place_can_randomized_image_only: robosuite_act_can_randomized_image_only
+    pick_place_can_randomized_with_conditioning: robosuite_act_can_randomized_with_conditioning
+    assembly_square_fixed_image_only: robosuite_act_square_fixed_image_only
+    assembly_square_fixed_with_conditioning: robosuite_act_square_fixed_with_conditioning
+    assembly_square_randomized_image_only: robosuite_act_square_randomized_image_only
+    assembly_square_randomized_with_conditioning: robosuite_act_square_randomized_with_conditioning
+    push_fixed_image_only: maniskill_act_push_fixed_image_only
+    push_fixed_with_conditioning: maniskill_act_push_fixed_with_conditioning
+    push_randomized_image_only: maniskill_act_push_randomized_image_only
+    push_randomized_with_conditioning: maniskill_act_push_randomized_with_conditioning
+    lift_upright_fixed_image_only: maniskill_act_lift_upright_fixed_image_only
+    lift_upright_fixed_with_conditioning: maniskill_act_lift_upright_fixed_with_conditioning
+    lift_upright_randomized_image_only: maniskill_act_lift_upright_randomized_image_only
+    lift_upright_randomized_with_conditioning: maniskill_act_lift_upright_randomized_with_conditioning
+    roll_ball_fixed_image_only: maniskill_act_roll_ball_fixed_image_only
+    roll_ball_fixed_with_conditioning: maniskill_act_roll_ball_fixed_with_conditioning
+    roll_ball_randomized_image_only: maniskill_act_roll_ball_randomized_image_only
+    roll_ball_randomized_with_conditioning: maniskill_act_roll_ball_randomized_with_conditioning
+
+  fig7:
+    lift_no_crop_image_only: robosuite_act_lift_no_crop_image_only
+    lift_no_crop_with_conditioning: robosuite_act_lift_no_crop_with_conditioning
+    pick_place_can_no_crop_image_only: robosuite_act_can_no_crop_image_only
+    pick_place_can_no_crop_with_conditioning: robosuite_act_can_no_crop_with_conditioning
+    assembly_square_no_crop_image_only: robosuite_act_square_no_crop_image_only
+    assembly_square_no_crop_with_conditioning: robosuite_act_square_no_crop_with_conditioning
+    lift_crop_image_only: robosuite_act_lift_randomized_image_only
+    lift_crop_with_conditioning: robosuite_act_lift_randomized_with_conditioning
+    pick_place_can_crop_image_only: robosuite_act_can_randomized_image_only
+    pick_place_can_crop_with_conditioning: robosuite_act_can_randomized_with_conditioning
+    assembly_square_crop_image_only: robosuite_act_square_randomized_image_only
+    assembly_square_crop_with_conditioning: robosuite_act_square_randomized_with_conditioning
+
+  fig8:
+    delta_eef_image_only: robosuite_act_lift_randomized_image_only
+    delta_eef_with_conditioning: robosuite_act_lift_randomized_with_conditioning
+    absolute_eef_image_only: robosuite_act_lift_absolute_eef_image_only
+    absolute_eef_with_conditioning: robosuite_act_lift_absolute_eef_with_conditioning
+    delta_joint_image_only: robosuite_act_lift_delta_joint_image_only
+    delta_joint_with_conditioning: robosuite_act_lift_delta_joint_with_conditioning
+    absolute_joint_image_only: robosuite_act_lift_absolute_joint_image_only
+    absolute_joint_with_conditioning: robosuite_act_lift_absolute_joint_with_conditioning
+
+  fig9:
+    lift_vector: robosuite_act_lift_vector
+    pick_place_can_vector: robosuite_act_can_vector
+    assembly_square_vector: robosuite_act_square_vector
+    lift_early_concat: robosuite_act_lift_early_concat
+    pick_place_can_early_concat: robosuite_act_can_early_concat
+    assembly_square_early_concat: robosuite_act_square_early_concat
+    lift_late_concat: robosuite_act_lift_randomized_with_conditioning
+    pick_place_can_late_concat: robosuite_act_can_randomized_with_conditioning
+    assembly_square_late_concat: robosuite_act_square_randomized_with_conditioning
+
+  fig10:
+    no_pretrain_image_only: robosuite_act_lift_no_pretrain_image_only
+    no_pretrain_with_conditioning: robosuite_act_lift_no_pretrain_with_conditioning
+    r3m_image_only: robosuite_act_lift_r3m_image_only
+    r3m_with_conditioning: robosuite_act_lift_r3m_with_conditioning
+    imagenet_image_only: robosuite_act_lift_randomized_image_only
+    imagenet_with_conditioning: robosuite_act_lift_randomized_with_conditioning
+
+  fig11:
+    n10_image_only: robosuite_act_lift_scaling_n10_image_only
+    n10_with_conditioning: robosuite_act_lift_scaling_n10_with_conditioning
+    n22_image_only: robosuite_act_lift_scaling_n22_image_only
+    n22_with_conditioning: robosuite_act_lift_scaling_n22_with_conditioning
+    n45_image_only: robosuite_act_lift_scaling_n45_image_only
+    n45_with_conditioning: robosuite_act_lift_scaling_n45_with_conditioning
+    n100_image_only: robosuite_act_lift_scaling_n100_image_only
+    n100_with_conditioning: robosuite_act_lift_scaling_n100_with_conditioning
+    n215_image_only: robosuite_act_lift_scaling_n215_image_only
+    n215_with_conditioning: robosuite_act_lift_scaling_n215_with_conditioning
+    n445_image_only: robosuite_act_lift_scaling_n445_image_only
+    n445_with_conditioning: robosuite_act_lift_scaling_n445_with_conditioning
+    n1000_image_only: robosuite_act_lift_scaling_n1000_image_only
+    n1000_with_conditioning: robosuite_act_lift_scaling_n1000_with_conditioning
+
+  table1:
+    act_lift_image_only: robosuite_act_lift_randomized_image_only
+    act_lift_with_conditioning: robosuite_act_lift_randomized_with_conditioning
+    act_pick_place_can_image_only: robosuite_act_can_randomized_image_only
+    act_pick_place_can_with_conditioning: robosuite_act_can_randomized_with_conditioning
+    act_assembly_square_image_only: robosuite_act_square_randomized_image_only
+    act_assembly_square_with_conditioning: robosuite_act_square_randomized_with_conditioning
+    act_push_image_only: maniskill_act_push_randomized_image_only
+    act_push_with_conditioning: maniskill_act_push_randomized_with_conditioning
+    act_lift_upright_image_only: maniskill_act_lift_upright_randomized_image_only
+    act_lift_upright_with_conditioning: maniskill_act_lift_upright_randomized_with_conditioning
+    act_roll_ball_image_only: maniskill_act_roll_ball_randomized_image_only
+    act_roll_ball_with_conditioning: maniskill_act_roll_ball_randomized_with_conditioning
+    dp_lift_image_only: robosuite_dp_lift_image_only
+    dp_lift_with_conditioning: robosuite_dp_lift_with_conditioning
+    dp_pick_place_can_image_only: robosuite_dp_can_image_only
+    dp_pick_place_can_with_conditioning: robosuite_dp_can_with_conditioning
+    dp_assembly_square_image_only: robosuite_dp_square_image_only
+    dp_assembly_square_with_conditioning: robosuite_dp_square_with_conditioning
+    dp_push_image_only: maniskill_dp_push_image_only
+    dp_push_with_conditioning: maniskill_dp_push_with_conditioning
+    dp_lift_upright_image_only: maniskill_dp_lift_upright_image_only
+    dp_lift_upright_with_conditioning: maniskill_dp_lift_upright_with_conditioning
+    dp_roll_ball_image_only: maniskill_dp_roll_ball_image_only
+    dp_roll_ball_with_conditioning: maniskill_dp_roll_ball_with_conditioning
+    smolvla_lift_image_only: robosuite_smolvla_lift_image_only
+    smolvla_lift_with_conditioning: robosuite_smolvla_lift_with_conditioning
+    smolvla_pick_place_can_image_only: robosuite_smolvla_can_image_only
+    smolvla_pick_place_can_with_conditioning: robosuite_smolvla_can_with_conditioning
+    smolvla_assembly_square_image_only: robosuite_smolvla_square_image_only
+    smolvla_assembly_square_with_conditioning: robosuite_smolvla_square_with_conditioning
+    smolvla_push_image_only: maniskill_smolvla_push_image_only
+    smolvla_push_with_conditioning: maniskill_smolvla_push_with_conditioning
+    smolvla_lift_upright_image_only: maniskill_smolvla_lift_upright_image_only
+    smolvla_lift_upright_with_conditioning: maniskill_smolvla_lift_upright_with_conditioning
+    smolvla_roll_ball_image_only: maniskill_smolvla_roll_ball_image_only
+    smolvla_roll_ball_with_conditioning: maniskill_smolvla_roll_ball_with_conditioning
