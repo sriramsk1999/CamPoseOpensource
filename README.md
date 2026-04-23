@@ -20,6 +20,9 @@
       <img src='https://img.shields.io/badge/Project-Page-blue?style=flat&logo=Google%20chrome&logoColor=blue' alt='Project Page'>
     </a>
   </p>
+  <p align="center">
+    <strong>Accepted to ICRA 2026</strong> (Vienna, June 2026)
+  </p>
 </p>
 
 ## Installation
@@ -51,6 +54,19 @@ or in ManiSkill with
 ```
 python policy_maniskill/train.py
 ```
+
+## Reproducing the paper
+Every experiment in the paper is specified in [`reproduce/paper_runs.yaml`](reproduce/paper_runs.yaml), keyed by figure (e.g. `fig6`) and entry. To launch one run, pass the figure, entry, and seed:
+```
+python reproduce/reproduce.py --paper_item fig6 --exp lift_randomized_with_conditioning --seed 0
+```
+This invokes the matching `train.py` with the exact overrides and seed used for the paper.
+
+If you use a coding agent (Cursor, Claude Code, Codex, etc.), you can point it at [`reproduce/SKILL.md`](reproduce/SKILL.md) and just say e.g. "reproduce fig 6 lift randomized with conditioning" — it will ask about your scheduler and draft a job script. I honestly don't know how well this works in practice yet.
+
+Results will not be bitwise identical across machines — this is not guaranteed on modern GPUs (see [this blog](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/) for background) — but numbers should match the paper in expectation. If something looks off, or you hit any other issue, I'd really appreciate hearing about it — please open an issue or email `tianchongj [at] ttic [dot] edu`.
+
+Training runs are long (typically hours to a day per seed on one GPU), so in practice you'll want a cluster (SLURM or similar).
 
 ## Plücker Snippet
 To add camera conditioning to your policy, you can use the following minimalist snippet to get Plücker raymap from intrinsics and extrinsics. (It assumes OpenCV convention i.e. image origin at top-left, +z is forward.)
