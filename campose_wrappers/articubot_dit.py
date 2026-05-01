@@ -58,14 +58,32 @@ def _passthrough_normalizer(shape_meta):
     return norm
 
 
-_HIDDEN = 512
-# RoPE4DDiT's default output_dim=26 is hardcoded for a specific task;
-# override so action_decoder's in_dim (hidden_size=512) matches.
-_DIFFUSION_MODEL_CFG = {
-    "num_attention_heads": 8,
-    "attention_head_dim": _HIDDEN // 8,
+# Match ArticuBot/diffusion_policy/config/train_flow_matching_{,rope4d_}dit_workspace.yaml.
+_HIDDEN = 1024
+_HEAD_DIM = 64
+_NUM_LAYERS = 12
+
+# Shared DiT params (both FlowMatchingDiTImagePolicy and FlowMatchingRoPE4DDiTImagePolicy).
+# Default output_dim=26 is hardcoded for an ArticuBot task; override to hidden_size
+# so action_decoder (in_dim=hidden_size) matches DiT output.
+_DIFFUSION_MODEL_CFG_BASE = {
+    "num_attention_heads": _HIDDEN // _HEAD_DIM,
+    "attention_head_dim": _HEAD_DIM,
     "output_dim": _HIDDEN,
-    "num_layers": 12,
+    "num_layers": _NUM_LAYERS,
+}
+
+# RGB variant adds interleave_self_attention=True (BasicTransformerBlock-based DiT).
+_DIFFUSION_MODEL_CFG_RGB = {
+    **_DIFFUSION_MODEL_CFG_BASE,
+    "interleave_self_attention": True,
+}
+
+# RoPE4D variant adds RoPE4D-specific base_frequency. interleave_self_attention is
+# rejected by RoPE4DDiT's constructor, so it does NOT inherit _DIFFUSION_MODEL_CFG_RGB.
+_DIFFUSION_MODEL_CFG_ROPE4D = {
+    **_DIFFUSION_MODEL_CFG_BASE,
+    "base_frequency": 100.0,
 }
 
 # Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview.yaml.
@@ -229,9 +247,14 @@ class _ArticubotWrapperBase(nn.Module):
         return {"loss": loss}
 
     def _predict(self, batch, norm_stats):
-        """Obs-only CamPose batch → action tensor (B, horizon, action_dim)."""
+        """Obs-only CamPose batch → action tensor (B, n_action_steps, action_dim).
+
+        Uses ``predict_action`` -> "action" (the n_action_steps-truncated chunk)
+        rather than "action_pred" (full horizon) — open-looping the full horizon
+        is what flow-matching policies are most fragile to.
+        """
         obs = self._build_ab_obs(batch, norm_stats)
-        return self.policy.predict_action(obs)["action_pred"]
+        return self.policy.predict_action(obs)["action"]
 
 
 class ArticubotDiTWrapper(_ArticubotWrapperBase):
@@ -261,7 +284,12 @@ class ArticubotDiTWrapper(_ArticubotWrapperBase):
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
-            diffusion_model_cfg=_DIFFUSION_MODEL_CFG,
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ROPE4D),
+            # World coords are in meters (~0–1.5). xyz_scale=100 puts them in
+            # RoPE's resolvable frequency band; time_scale=18 maps t to integer
+            # step indices over n_obs_steps + horizon.
+            xyz_scale=100.0,
+            time_scale=18.0,
         )
 
     def _add_geometry_obs(self, obs, batch, n_cams):
@@ -317,7 +345,8 @@ class ArticubotDiTRGBWrapper(_ArticubotWrapperBase):
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
-            diffusion_model_cfg=_DIFFUSION_MODEL_CFG,
+            pos_embed_type="none",
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
         )
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc):

@@ -498,6 +498,7 @@ class EpisodicDataset(Dataset):
         robot_qpos = states[start_ts][:7]
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
+            eef_xyz = np.zeros_like(eef_xyz)
         actions_seq = actions[start_ts:]
 
         padded_actions = np.zeros((self.max_seq_length, actions.shape[1]), dtype=np.float32)

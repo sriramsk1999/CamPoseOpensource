@@ -224,7 +224,8 @@ class Evaluator:
             ], dtype=np.float32)
         ).unsqueeze(0).cuda()
 
-    def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set):
+    def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set,
+                              drop_proprio=False):
         """Inference batch. Center-crop 256→crop_dst with matching K."""
         top, left, dst = self.crop_top, self.crop_left, self.crop_dst
         imgs, pms, extrs = [], [], []
@@ -239,12 +240,15 @@ class Evaluator:
             extrs.append(torch.from_numpy(cam_pose).float())
         n = len(imgs)
         K_crop_t = torch.from_numpy(self.K_crop).float().unsqueeze(0).expand(n, -1, -1)
+        eef_xyz = self._eef_xyz()
+        if drop_proprio:
+            eef_xyz = torch.zeros_like(eef_xyz)
         return {
             'image': torch.stack(imgs, dim=0).unsqueeze(0).cuda(),
             'pointmap': torch.stack(pms, dim=0).unsqueeze(0).cuda(),
             'cam_extrinsics_full': torch.stack(extrs, dim=0).unsqueeze(0).cuda(),
             'cam_intrinsics_full': K_crop_t.unsqueeze(0).cuda(),
-            'eef_xyz': self._eef_xyz(),
+            'eef_xyz': eef_xyz,
             'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
         }
 
@@ -303,9 +307,14 @@ class Evaluator:
             camera_frames.append(camera_frame)
             success_labels.append(has_succeeded)
 
+            # One drop draw per step gates both qpos and eef_xyz, matching
+            # the dataloader (utils.py: see prob_drop_proprio block).
+            drop_proprio = bool(np.random.rand() < self.args.prob_drop_proprio)
+
             if self.is_dino:
                 batch = self._build_pointmap_batch(
                     per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
+                    drop_proprio=drop_proprio,
                 )
             else:
                 per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
@@ -316,7 +325,7 @@ class Evaluator:
                 }
 
             state_vector = self.env.sim.data.qpos[:7]
-            if np.random.rand() < self.args.prob_drop_proprio:
+            if drop_proprio:
                 state_vector = np.zeros_like(state_vector)
             normalized_state = (state_vector - self.norm_stats["state_mean"].cpu().numpy()) / self.norm_stats["state_std"].cpu().numpy()
             state_tensor = einops.rearrange(torch.tensor(normalized_state, device="cuda").float(), 'd -> 1 d')

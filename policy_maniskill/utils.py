@@ -450,6 +450,7 @@ class EpisodicDataset(Dataset):
         # Match robosuite behavior: optionally drop proprio to zeros with probability prob_drop_proprio
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
+            eef_xyz = np.zeros_like(eef_xyz)
         actions_seq = actions[start_ts:]
 
         padded_actions = np.zeros((self.max_seq_length, actions.shape[1]), dtype=np.float32)
