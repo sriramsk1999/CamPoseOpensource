@@ -32,7 +32,15 @@ def _ensure_articubot_on_path():
 
 
 def _passthrough_normalizer(shape_meta):
-    """LinearNormalizer with identity per-field normalization."""
+    """LinearNormalizer with identity per-field normalization.
+
+    IMPORTANT: ``SingleFieldLinearNormalizer.create_manual`` builds an
+    ``nn.ParameterDict`` whose values default to ``requires_grad=True``.
+    Upstream's ``set_normalizer`` path calls ``requires_grad_(False)`` after
+    loading state dict; we replicate that here, otherwise these "stats" end up
+    in ``optimizer.param_groups`` and AdamW + weight_decay slowly drift the
+    scale/offset during training — fits per-step loss, breaks integration.
+    """
     from diffusion_policy.model.common.normalizer import (
         LinearNormalizer, SingleFieldLinearNormalizer,
     )
@@ -55,6 +63,7 @@ def _passthrough_normalizer(shape_meta):
     norm["action"] = _identity(shape_meta["action"]["shape"])
     for k, attr in shape_meta["obs"].items():
         norm[k] = _identity(attr["shape"])
+    norm.requires_grad_(False)
     return norm
 
 

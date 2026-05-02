@@ -97,7 +97,22 @@ def main(args, ckpt=None):
         raise ValueError(f"Unsupported policy_class: {args.policy_class}")
 
     optimizer = policy.configure_optimizers()
-    # Learning rate schedule: cosine with warmup for SmolVLA, constant otherwise
+
+    # Flow-matching policies (articubot_dit{,_rgb}) use EMA
+    use_ema = args.policy_class in ('articubot_dit', 'articubot_dit_rgb')
+    ema = None
+    eval_policy = policy
+    if use_ema:
+        import copy
+        from diffusion_policy.model.diffusion.ema_model import EMAModel
+        ema_policy = copy.deepcopy(policy)
+        ema = EMAModel(
+            ema_policy,
+            update_after_step=0, inv_gamma=1.0, power=0.75,
+            min_value=0.0, max_value=0.9999,
+        )
+        eval_policy = ema_policy
+
     steps_per_epoch = len(train_dataloader)
     total_steps = args.num_epochs * steps_per_epoch
     if args.lr_scheduler == 'cosine':
@@ -109,6 +124,10 @@ def main(args, ckpt=None):
     epoch = 0
     if ckpt is not None:
         policy.load_state_dict(ckpt['model_state_dict'])
+        if ema is not None:
+            ema.averaged_model.load_state_dict(ckpt['model_state_dict'])
+            ema.optimization_step = ckpt.get('ema_optimization_step', 0)
+            ema.decay = ckpt.get('ema_decay', 0.0)
         if 'optimizer_state_dict' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         if 'scheduler_state_dict' in ckpt:
@@ -123,11 +142,11 @@ def main(args, ckpt=None):
         # Validation
         if epoch % 10 == 0:
             with torch.inference_mode():
-                policy.eval()
+                eval_policy.eval()
                 epoch_dicts = []
                 for data in val_dataloader:
                     with torch.autocast("cuda", dtype=torch.bfloat16) if args.use_fp16 else nullcontext():
-                        forward_dict = policy(data)
+                        forward_dict = eval_policy(data)
                     epoch_dicts.append(forward_dict)
                 epoch_summary = compute_dict_mean(epoch_dicts)
                 for k, v in epoch_summary.items():
@@ -135,7 +154,7 @@ def main(args, ckpt=None):
 
         # Evaluation
         if epoch % args.eval_every == 0:
-            policy.eval()
+            eval_policy.eval()
             for pose_name in ['train', 'test']:
                 eval_save_path = os.path.join(args.ckpt_dir, f"eval_epoch_{epoch}_{pose_name}")
                 os.makedirs(eval_save_path, exist_ok=True)
@@ -145,7 +164,7 @@ def main(args, ckpt=None):
                 for episode_idx in range(50 if epoch > args.eval_start_epoch else args.eval_episodes):
                     with torch.no_grad():
                         _, success_rate, _ = evaluator.evaluate(
-                            policy=policy,
+                            policy=eval_policy,
                             save_path=eval_save_path,
                             video_prefix=f"epoch_{epoch}_episode_{episode_idx}",
                             pose_name=pose_name,
@@ -160,14 +179,18 @@ def main(args, ckpt=None):
         # Save checkpoint
         if epoch % args.save_every == 0:
             checkpoint_path = os.path.join(args.ckpt_dir, f'epoch_{epoch}.pth')
-            torch.save({
-                'epoch': epoch, 
-                'model_state_dict': policy.state_dict(),
+            ckpt_payload = {
+                'epoch': epoch,
+                'model_state_dict': eval_policy.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'loss': epoch_summary['loss'], 
-                'wandb_id': wandb.run.id
-            }, checkpoint_path)
+                'loss': epoch_summary['loss'],
+                'wandb_id': wandb.run.id,
+            }
+            if ema is not None:
+                ckpt_payload['ema_optimization_step'] = ema.optimization_step
+                ckpt_payload['ema_decay'] = ema.decay
+            torch.save(ckpt_payload, checkpoint_path)
             cleanup_ckpt(args.ckpt_dir, keep=3)  # Keep last 3 checkpoints
 
             # if time.time() - start_time > 7.5 * 60 * 60:
@@ -187,6 +210,8 @@ def main(args, ckpt=None):
             wandb.log({'lr': optimizer.param_groups[0]['lr']}, step=epoch)
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+            if ema is not None:
+                ema.step(policy)
             train_history.append(detach_dict(forward_dict))
         
         epoch_summary = compute_dict_mean(train_history)
