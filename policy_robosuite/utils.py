@@ -139,7 +139,9 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
             actions = dataset_file[f'data/{demo_key}/actions'][()].astype(np.float32)
             
             # Extract only robot joint positions (first 7 dimensions)
-            robot_qpos = states[:, :7]  # Robot joint positions
+            # MjSimState.flatten() lays states out as [time, qpos, qvel];
+            # the 7 arm joints live at indices 1..8, not 0..7.
+            robot_qpos = states[:, 1:8]
 
             all_states_data.append(robot_qpos)
             all_action_data.append(actions)
@@ -495,7 +497,7 @@ class EpisodicDataset(Dataset):
             cam_extrinsics = torch.zeros(2, 4, 4, device='cuda')
 
         # Normalize and convert to tensors
-        robot_qpos = states[start_ts][:7]
+        robot_qpos = states[start_ts][1:8]
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
             eef_xyz = np.zeros_like(eef_xyz)
