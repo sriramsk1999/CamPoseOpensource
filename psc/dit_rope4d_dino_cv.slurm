@@ -16,6 +16,8 @@ conda activate know_your_camera
 
 cd "$SLURM_SUBMIT_DIR"
 
+export ARTICUBOT_DP="$(cd "$SLURM_SUBMIT_DIR/../ArticuBot/diffusion_policy" && pwd)"
+
 # Ours — GROOT-DINO-CV-RoPE4D (DA3 weights + CameraEnc baked into the wrapper).
 python policy_robosuite/train.py \
     --name dit_rope4d_dino_cv_square_seed_0 \

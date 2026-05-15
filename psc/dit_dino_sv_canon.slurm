@@ -16,6 +16,8 @@ conda activate know_your_camera
 
 cd "$SLURM_SUBMIT_DIR"
 
+export ARTICUBOT_DP="$(cd "$SLURM_SUBMIT_DIR/../ArticuBot/diffusion_policy" && pwd)"
+
 python policy_robosuite/train.py \
     --name dit_dino_sv_canon_square_seed_0 \
     --seed 0 \

@@ -19,6 +19,10 @@ conda activate know_your_camera
 # cd's to the repo root before each sbatch call, so this lands at the repo.
 cd "$SLURM_SUBMIT_DIR"
 
+# ArticuBot is checked out as a sibling of CamPoseOpensource on the cluster
+# (defaults to ~/Desktop/ArticuBot on the dev box). Point sidecar at it.
+export ARTICUBOT_DP="$(cd "$SLURM_SUBMIT_DIR/../ArticuBot/diffusion_policy" && pwd)"
+
 python policy_robosuite/train.py \
     --name act_dino_sv_plucker_square_seed_0 \
     --seed 0 \
