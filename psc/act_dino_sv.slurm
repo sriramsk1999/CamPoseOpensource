@@ -14,8 +14,10 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate know_your_camera
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+# Slurm copies the script to a temp scratch dir, so $0 doesn't point at the
+# repo. $SLURM_SUBMIT_DIR is the directory you ran sbatch from — submit_all.sh
+# cd's to the repo root before each sbatch call, so this lands at the repo.
+cd "$SLURM_SUBMIT_DIR"
 
 python policy_robosuite/train.py \
     --name act_dino_sv_plucker_square_seed_0 \

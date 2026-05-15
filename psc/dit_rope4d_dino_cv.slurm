@@ -14,8 +14,7 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate know_your_camera
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$SLURM_SUBMIT_DIR"
 
 # Ours — GROOT-DINO-CV-RoPE4D (DA3 weights + CameraEnc baked into the wrapper).
 python policy_robosuite/train.py \

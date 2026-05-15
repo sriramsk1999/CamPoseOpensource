@@ -14,8 +14,7 @@ set -euo pipefail
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate know_your_camera
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$SLURM_SUBMIT_DIR"
 
 python policy_robosuite/train.py \
     --name dit_dino_sv_plucker_square_seed_0 \
