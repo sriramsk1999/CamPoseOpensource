@@ -249,7 +249,9 @@ class EpisodicDataset(Dataset):
         self.args = args
         self.image_size = 256
         self.use_plucker = args.use_plucker
-        self.is_articubot = args.policy_class in ('articubot_dit', 'articubot_dit_rgb')
+        self.is_articubot = args.policy_class in (
+            'dit_rope4d_dino_cv', 'dit_dino_sv',
+        )
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         self.env = env
 

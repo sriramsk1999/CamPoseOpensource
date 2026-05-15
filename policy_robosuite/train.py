@@ -21,7 +21,10 @@ from models.smolvla import SmolVLAPolicyWrapper
 import sys as _sys
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 _sys.path.insert(0, _REPO_ROOT)
-from campose_wrappers.articubot_dit import ArticubotDiTWrapper, ArticubotDiTRGBWrapper
+from campose_wrappers.articubot_dit import (
+    ArticubotRoPE4DWrapper,
+    ArticubotDiTSingleViewWrapper,
+)
 
 import wandb
 
@@ -82,12 +85,12 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
-    elif args.policy_class in ('articubot_dit', 'articubot_dit_rgb'):
+    elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv'):
         # Robosuite Panda: eef_xyz(3) + qpos(7) = 10-dim state.
-        wrapper_cls = (
-            ArticubotDiTWrapper if args.policy_class == 'articubot_dit'
-            else ArticubotDiTRGBWrapper
-        )
+        wrapper_cls = {
+            'dit_rope4d_dino_cv': ArticubotRoPE4DWrapper,
+            'dit_dino_sv':        ArticubotDiTSingleViewWrapper,
+        }[args.policy_class]
         policy = wrapper_cls(
             args=args,
             state_dim=3 + 7,
@@ -96,11 +99,11 @@ def main(args, ckpt=None):
             image_size=224,
             norm_stats=stats,
         ).cuda()
-    
+
     optimizer = policy.configure_optimizers()
 
-    # Flow-matching policies (articubot_dit{,_rgb}) use EMA
-    use_ema = args.policy_class in ('articubot_dit', 'articubot_dit_rgb')
+    # Flow-matching DiT policies use EMA.
+    use_ema = args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv')
     ema = None
     eval_policy = policy
     if use_ema:
@@ -254,7 +257,10 @@ if __name__ == '__main__':
                         help='Path to camera poses directory (absolute). If None, defaults to policy_robosuite/camera_poses')
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
-    parser.add_argument('--policy_class', type=str, default='act', choices=['dp','act','smolvla','articubot_dit','articubot_dit_rgb', 'act_dino'], help='policy class')
+    parser.add_argument('--policy_class', type=str, default='act',
+                        choices=['dp', 'act', 'smolvla', 'act_dino',
+                                 'dit_rope4d_dino_cv', 'dit_dino_sv'],
+                        help='policy class')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 
@@ -304,14 +310,6 @@ if __name__ == '__main__':
     parser.add_argument('--dec_layers', type=int, default=7, help='number of decoder layers')
     parser.add_argument('--pre_norm', type=bool, default=True, help='use pre-normalization')
     parser.add_argument('--activation', default='relu', help='activation function')
-
-    # act_dino model config
-    parser.add_argument('--dino_backbone', type=str, default='vitb', choices=['vits', 'vitb', 'vitl'],
-                        help='DINOv2 backbone size for act_dino')
-    parser.add_argument('--dino_pretrained', default=True, type=str2bool,
-                        help='load pretrained DINOv2 weights for act_dino')
-    parser.add_argument('--dino_camera_enc', default=False, type=str2bool,
-                        help='enable CameraEnc (geometry-aware camera tokens) in act_dino backbone')
 
     # Backbone config
     parser.add_argument('--backbone', default='late_imagenet', help='backbone: resnet, linear')

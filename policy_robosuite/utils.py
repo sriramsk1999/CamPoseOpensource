@@ -272,13 +272,12 @@ class EpisodicDataset(Dataset):
         self.image_size = 256  # Standard image size
         self.use_plucker = args.use_plucker
         self.num_cameras = args.num_side_cam
-        # Articubot variants (RoPE4D + RGB-only) share the paired 224 crop
-        # and depth-derived pointmap path; legacy policies keep the 256 path.
-        # Single DINO/paired-crop codepath: articubot DiT variants and act_dino
-        # all consume 224-cropped RGB (+Plucker) with adjusted intrinsics and a
-        # pointmap. act_dino simply ignores the pointmap field.
+        # DiT variants (RoPE4D + cross-view + single-view) share the paired
+        # 224 crop and depth-derived pointmap path; legacy policies keep the
+        # 256 path. act_dino consumes the same 224-cropped RGB (+Plucker) and
+        # simply ignores the pointmap field.
         self.is_dino = args.policy_class in (
-            'articubot_dit', 'articubot_dit_rgb', 'act_dino'
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
         )
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         

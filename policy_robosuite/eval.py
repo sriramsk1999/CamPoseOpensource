@@ -99,14 +99,13 @@ class Evaluator:
         self.plucker_embedder = PluckerEmbedder(img_size=256, device='cuda')
         self.intrinsics = self._get_camera_intrinsics()
 
-        # articubot_dit{,_rgb} feeds center-cropped (crop_dst, crop_dst) tensors
-        # to the policy and additionally consumes depth-derived pointmaps.
+        # DiT variants feed center-cropped (crop_dst, crop_dst) tensors to the
+        # policy. dit_rope4d additionally consumes depth-derived pointmaps.
         # Crop constants are static (center crop), so precompute them once.
-        # Single DINO/paired-crop codepath shared by articubot DiT variants and
-        # act_dino: center-crop 256→224, adjust K, emit pointmap. act_dino
-        # simply ignores the pointmap field.
+        # All DiT + act_dino paths share the 256→224 paired-crop, adjusted K,
+        # and emit a pointmap. act_dino and dit_dino_* simply ignore it.
         self.is_dino = getattr(args, 'policy_class', '') in (
-            'articubot_dit', 'articubot_dit_rgb', 'act_dino'
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
         )
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2

@@ -1,9 +1,14 @@
 """Adapters that train ArticuBot's flow-matching DiT policies with the
 CamPose train loops in ``policy_robosuite/`` and ``policy_maniskill/``.
 
-Two variants are exposed:
-  - ``ArticubotDiTWrapper``    → FlowMatchingRoPE4DDiTImagePolicy (geometry-aware)
-  - ``ArticubotDiTRGBWrapper`` → FlowMatchingDiTImagePolicy       (RGB-only)
+Two variants are exposed (= the two GROOT baselines we evaluate against):
+  - ``ArticubotRoPE4DWrapper``         → FlowMatchingRoPE4DDiTImagePolicy
+                                          (GROOT-DINO-CV-RoPE4D: RoPE4D DiT +
+                                          DA3 cross-view DINO with CameraEnc +
+                                          pointmap geometry)
+  - ``ArticubotDiTSingleViewWrapper``  → FlowMatchingDiTImagePolicy
+                                          (GROOT-DINO-SV-Plucker: vanilla DiT +
+                                          single-view DINOv2 + Plucker ViT)
 
 ArticuBot is imported as a sidecar package (no vendoring) — set the
 ``ARTICUBOT_DP`` env var to the ``ArticuBot/diffusion_policy`` directory
@@ -95,21 +100,36 @@ _DIFFUSION_MODEL_CFG_ROPE4D = {
     "base_frequency": 100.0,
 }
 
-# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview.yaml.
-# The encoder's __init__ defaults are 4 but the shipping YAML overrides to 6,
-# and its ``visual_encoder_cfg={}`` path would otherwise fall back to 4.
-_DINO_CROSSVIEW_CFG = {
+# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview_da3.yaml
+# (the DepthAnything3-pretrained variant — alt/qknorm/rope_start pinned to 4 for
+# byte-compatible state_dict load, no camera noise). Override include_camera_enc
+# because the GROOT-DINO-CV-RoPE4D baseline uses CameraEnc (geometry-aware
+# camera tokens injected at alt_start).
+_DINO_CROSSVIEW_DA3_CFG = {
     "backbone": "vitb",
     "pretrained": True,
-    "alt_start": 6,
-    "qknorm_start": 6,
-    "rope_start": 6,
+    "weights_source": "da3",
+    "alt_start": 4,
+    "qknorm_start": 4,
+    "rope_start": 4,
     "cat_token": True,
-    "camera_noise_cfg": {
-        "translation_std": 0.01,
-        "rotation_deg_std": 1.5,
-        "focal_rel_std": 0.015,
-        "principal_point_px_std": 3.0,
+    "include_camera_enc": True,
+    "camera_noise_cfg": None,
+}
+
+# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dinov2_plucker.yaml.
+# Single-view DINOv2-base with last 8 of 12 transformer blocks + final LN
+# unfrozen; sibling Plucker ViT trained from scratch over 6-channel rays.
+_DINOV2_PLUCKER_CFG = {
+    "model_name": "facebook/dinov2-base",
+    "frozen": True,
+    "num_unfrozen_blocks": 8,
+    "plucker_vit_cfg": {
+        "patch_size": 14,
+        "embed_dim": 384,
+        "depth": 4,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
     },
 }
 
@@ -266,8 +286,14 @@ class _ArticubotWrapperBase(nn.Module):
         return self.policy.predict_action(obs)["action"]
 
 
-class ArticubotDiTWrapper(_ArticubotWrapperBase):
-    """Trains FlowMatchingRoPE4DDiTImagePolicy (RoPE4D, geometry-aware)."""
+class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
+    """GROOT-DINO-CV-RoPE4D: RoPE4D DiT + DA3-pretrained cross-view DINO.
+
+    Mirrors ArticuBot's ``visual_encoder=dino_crossview_da3`` +
+    ``train_flow_matching_rope4d_dit_workspace`` recipe, with CameraEnc
+    enabled and the auxiliary pointmap loss disabled. The DA3 path also
+    loads pretrained CameraEnc weights (see ``load_pretrained_da3_cam_enc``).
+    """
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
         obs = {}
@@ -289,7 +315,7 @@ class ArticubotDiTWrapper(_ArticubotWrapperBase):
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
             visual_encoder_type="dino_crossview",
-            visual_encoder_cfg=dict(_DINO_CROSSVIEW_CFG),
+            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DA3_CFG),
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
@@ -299,6 +325,9 @@ class ArticubotDiTWrapper(_ArticubotWrapperBase):
             # step indices over n_obs_steps + horizon.
             xyz_scale=100.0,
             time_scale=18.0,
+            # Aux pointmap loss intentionally disabled — flip on by passing a
+            # weight (e.g. 0.1) to mirror the ArticuBot reference run.
+            aux_pointmap_loss_weight=None,
         )
 
     def _add_geometry_obs(self, obs, batch, n_cams):
@@ -330,13 +359,20 @@ class ArticubotDiTWrapper(_ArticubotWrapperBase):
         return policy.action_decoder(dit_out)
 
 
-class ArticubotDiTRGBWrapper(_ArticubotWrapperBase):
-    """Trains FlowMatchingDiTImagePolicy (RGB-only, no pointmap/extrinsic)."""
+class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
+    """Trains FlowMatchingDiTImagePolicy with single-view DINOv2 + Plucker ViT.
+
+    Each camera is encoded independently by a partially fine-tuned DINOv2 (last
+    8 transformer blocks + final LN unfrozen). Plucker rays are encoded by a
+    sibling small ViT and fused token-wise before the projector. No cross-view
+    attention; cross-view fusion is the contribution this baseline ablates.
+    """
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
         obs = {}
         for i in range(num_cams):
             obs[f"cam{i}_image"] = {"shape": [3, image_size, image_size], "type": "rgb"}
+            obs[f"cam{i}_plucker"] = {"shape": [6, image_size, image_size], "type": "plucker"}
         obs["state"] = {"shape": [state_dim], "type": "low_dim"}
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
@@ -349,14 +385,20 @@ class ArticubotDiTRGBWrapper(_ArticubotWrapperBase):
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
-            visual_encoder_type="dino_crossview",
-            visual_encoder_cfg=dict(_DINO_CROSSVIEW_CFG),
+            visual_encoder_type="dinov2_plucker",
+            visual_encoder_cfg=dict(_DINOV2_PLUCKER_CFG),
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
             pos_embed_type="none",
             diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
         )
+
+    def _add_geometry_obs(self, obs, batch, n_cams):
+        # Channels 3-9 of the CamPose-loader 9-channel image are 6-D Plucker rays.
+        plucker = batch["image"][:, :, 3:9]      # (B, n_cams, 6, H, W)
+        for i in range(n_cams):
+            obs[f"cam{i}_plucker"] = plucker[:, i].unsqueeze(1)
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc):
         B = noisy_actions.shape[0]

@@ -1,12 +1,10 @@
-"""ACT policy variant with a DINO Cross-View visual backbone.
+"""ACT policy with HuggingFace DINOv2 (single-view) + Plucker ViT backbone.
 
-Mirrors ``models.act`` but swaps the CNN backbone for ArticuBot's
-``DinoCrossViewTokenEncoder``. Imported via sidecar (no vendoring), matching
-the pattern in ``campose_wrappers/articubot_dit.py``.
+The only supported variant is ACT-DINO-SV-Plucker: each camera goes through a
+partially fine-tuned DINOv2 (last 8 transformer blocks + final LN unfrozen);
+Plucker rays are encoded by a sibling small ViT and fused token-wise before
+a single projector to the ACT hidden dim.
 """
-import os
-import sys
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -82,89 +80,80 @@ class PluckerViT(nn.Module):
         return rearrange(x, "(b s) n d -> b s n d", b=b, s=s)
 
 
-def _ensure_articubot_on_path():
-    path = os.environ.get("ARTICUBOT_DP") or os.path.expanduser(
-        "~/Desktop/ArticuBot/diffusion_policy"
-    )
-    if not os.path.isdir(path):
-        raise FileNotFoundError(
-            f"ArticuBot diffusion_policy dir not found at {path!r}. "
-            "Set ARTICUBOT_DP env var."
-        )
-    if path not in sys.path:
-        sys.path.insert(0, path)
+class BackboneDino(nn.Module):
+    """ACT-DINO-SV-Plucker backbone.
 
-
-class BackboneDinoCrossView(nn.Module):
-    """DINO Cross-View backbone wrapping ``DinoCrossViewTokenEncoder``.
-
-    Forward signature extends the existing CNN backbones to also accept
-    per-camera extrinsics (c2w) and intrinsics, so the underlying
-    ``CameraEnc`` can inject geometry-aware camera tokens.
+    Each camera goes through a HuggingFace DINOv2 backbone (last
+    ``num_unfrozen_blocks`` transformer blocks + final LN unfrozen). Plucker
+    rays are encoded by a sibling small ViT (trained from scratch) and fused
+    token-wise with the DINO RGB tokens before a single projector to
+    ``hidden_dim``.
     """
 
     def __init__(
         self,
         hidden_dim: int,
-        backbone: str = "vitb",
-        pretrained: bool = True,
         crop_shape=(224, 224),
-        alt_start: int = 6,
-        qknorm_start: int = 6,
-        rope_start: int = 6,
-        cat_token: bool = True,
-        include_camera_enc: bool = True,
         max_cams: int = 4,
-        use_plucker: bool = False,
+        model_name: str = "facebook/dinov2-base",
+        num_unfrozen_blocks: int = 8,
         plucker_vit_embed_dim: int = 384,
         plucker_vit_depth: int = 4,
         plucker_vit_num_heads: int = 6,
         plucker_vit_mlp_ratio: float = 4.0,
     ):
         super().__init__()
-        _ensure_articubot_on_path()
-        from diffusion_policy.model.flow_matching.dino_cross_view_encoder import (
-            DinoCrossViewTokenEncoder,
-        )
-
-        self.encoder = DinoCrossViewTokenEncoder(
-            cam_keys=[],
-            n_obs_steps=1,
-            embed_dim=hidden_dim,
-            crop_shape=crop_shape,
-            in_channels=3,
-            image_size=crop_shape[0],
-            backbone=backbone,
-            pretrained=pretrained,
-            alt_start=alt_start,
-            qknorm_start=qknorm_start,
-            rope_start=rope_start,
-            cat_token=cat_token,
-            include_camera_enc=include_camera_enc,
-        )
+        from transformers import AutoModel
 
         self.crop_h, self.crop_w = crop_shape
-        self.num_tokens_per_cam = self.encoder.num_tokens
         self.num_channels = hidden_dim
-        self.include_camera_enc = include_camera_enc
-        self.use_plucker = use_plucker
 
-        if use_plucker:
-            self.plucker_vit = PluckerViT(
-                crop_shape=crop_shape,
-                patch_size=14,
-                embed_dim=plucker_vit_embed_dim,
-                depth=plucker_vit_depth,
-                num_heads=plucker_vit_num_heads,
-                mlp_ratio=plucker_vit_mlp_ratio,
+        self.dino = AutoModel.from_pretrained(model_name)
+        for p in self.dino.parameters():
+            p.requires_grad = False
+        if num_unfrozen_blocks > 0:
+            n_layers = len(self.dino.encoder.layer)
+            assert num_unfrozen_blocks <= n_layers, (
+                f"num_unfrozen_blocks={num_unfrozen_blocks} exceeds "
+                f"backbone depth ({n_layers})"
             )
-            assert self.plucker_vit.num_patches == self.num_tokens_per_cam, (
-                f"PluckerViT patch count {self.plucker_vit.num_patches} must match "
-                f"DINO token count {self.num_tokens_per_cam}"
-            )
-            self.fused_projector = nn.Linear(
-                self.encoder.token_dim + plucker_vit_embed_dim, hidden_dim,
-            )
+            for layer in self.dino.encoder.layer[-num_unfrozen_blocks:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
+            for p in self.dino.layernorm.parameters():
+                p.requires_grad = True
+
+        self.token_dim = self.dino.config.hidden_size
+        ps = self.dino.config.patch_size
+        assert self.crop_h % ps == 0 and self.crop_w % ps == 0, (
+            f"crop_shape {crop_shape} must be divisible by DINOv2 patch_size {ps}"
+        )
+        self.num_tokens_per_cam = (self.crop_h // ps) * (self.crop_w // ps)
+
+        # HF Dinov2Model expects ImageNet-normalized inputs; the dataloader
+        # gives [0,1] RGB, so apply mean/std here.
+        self.register_buffer(
+            "img_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+        )
+
+        self.plucker_vit = PluckerViT(
+            crop_shape=crop_shape,
+            patch_size=ps,
+            embed_dim=plucker_vit_embed_dim,
+            depth=plucker_vit_depth,
+            num_heads=plucker_vit_num_heads,
+            mlp_ratio=plucker_vit_mlp_ratio,
+        )
+        assert self.plucker_vit.num_patches == self.num_tokens_per_cam, (
+            f"PluckerViT patch count {self.plucker_vit.num_patches} must match "
+            f"DINO token count {self.num_tokens_per_cam}"
+        )
+        self.fused_projector = nn.Linear(
+            self.token_dim + plucker_vit_embed_dim, hidden_dim,
+        )
 
         self.pos_embed = nn.Embedding(max_cams * self.num_tokens_per_cam, hidden_dim)
         nn.init.normal_(self.pos_embed.weight, std=0.02)
@@ -172,45 +161,37 @@ class BackboneDinoCrossView(nn.Module):
     def forward(self, images, extrinsics=None, intrinsics=None):
         """
         Args:
-            images:     (B, num_cam, C, H, W) — RGB (+optional Plucker) in [0, 1].
-                         Channels [0:3] are RGB, [3:9] Plucker rays when
-                         ``use_plucker`` is set.
-            extrinsics: (B, num_cam, 4, 4) c2w (optional).
-            intrinsics: (B, num_cam, 3, 3)       (optional).
+            images: (B, num_cam, 9, H, W) — channels [0:3] RGB in [0,1],
+                    channels [3:9] Plucker rays.
+            extrinsics/intrinsics: accepted for call-site parity with the
+                    legacy cross-view path; ignored here (single-view encoder
+                    has no use for camera geometry).
         Returns:
             features  : (B, num_cam * num_tokens_per_cam, hidden_dim)
             pos_embed : (B, num_cam * num_tokens_per_cam, hidden_dim)
         """
+        del extrinsics, intrinsics
         b, s = images.shape[:2]
+        assert images.size(2) == 9, (
+            f"act_dino expects 9-channel images (3 RGB + 6 Plucker), "
+            f"got {images.size(2)}"
+        )
         rgb = images[:, :, :3]
+        plucker = images[:, :, 3:9]
         assert rgb.shape[-2:] == (self.crop_h, self.crop_w), (
             f"act_dino expects pre-cropped ({self.crop_h}x{self.crop_w}) images, "
             f"got {tuple(rgb.shape[-2:])}"
         )
 
-        # CameraEnc internally does affine_inverse(extrinsics), i.e. it expects w2c.
-        # The CamPose dataloader supplies c2w, so invert here. Skip the work
-        # entirely when CameraEnc is disabled — the learned per-view camera
-        # token handles the None case inside forward_features.
-        w2c = None
-        intr = None
-        if self.include_camera_enc and extrinsics is not None and intrinsics is not None:
-            w2c = torch.linalg.inv(extrinsics)
-            intr = intrinsics
+        flat = rearrange(rgb, "b s c h w -> (b s) c h w")
+        flat = (flat - self.img_mean) / self.img_std
+        out = self.dino(pixel_values=flat)
+        tokens = out.last_hidden_state[:, 1:]  # drop CLS
+        tokens = rearrange(tokens, "(b s) n d -> b s n d", b=b, s=s)
 
-        tokens = self.encoder(rgb, extrinsics=w2c, intrinsics=intr)
-
-        if self.use_plucker:
-            assert images.size(2) == 9, (
-                f"use_plucker expects 9-channel images (3 RGB + 6 Plucker), "
-                f"got {images.size(2)}"
-            )
-            plucker = images[:, :, 3:9]
-            plucker_tokens = self.plucker_vit(plucker)  # (B, S, N_tok, plk_dim)
-            fused = torch.cat([tokens, plucker_tokens], dim=-1)
-            tokens = self.fused_projector(fused)  # (B, S, N_tok, hidden_dim)
-        else:
-            tokens = self.encoder.projector(tokens)  # (B, S, N_tok, hidden_dim)
+        plucker_tokens = self.plucker_vit(plucker)              # (B, S, N_tok, plk_dim)
+        fused = torch.cat([tokens, plucker_tokens], dim=-1)
+        tokens = self.fused_projector(fused)                    # (B, S, N_tok, hidden_dim)
 
         features = rearrange(tokens, "b s n d -> b (s n) d")
         total_len = features.shape[1]
@@ -318,22 +299,19 @@ class DETRVAEDino(nn.Module):
 
 
 def build_dino(args):
-    backbone = BackboneDinoCrossView(
+    # Visual-encoder + Plucker-ViT hyperparameters are hardcoded — they are
+    # tied to the architecture choice (ACT-DINO-SV-Plucker), not training-time
+    # knobs. Tune via source edit if needed.
+    backbone = BackboneDino(
         hidden_dim=args.hidden_dim,
-        backbone=getattr(args, "dino_backbone", "vitb"),
-        pretrained=getattr(args, "dino_pretrained", True),
-        crop_shape=tuple(getattr(args, "dino_crop_shape", (224, 224))),
-        alt_start=getattr(args, "dino_alt_start", 6),
-        qknorm_start=getattr(args, "dino_qknorm_start", 6),
-        rope_start=getattr(args, "dino_rope_start", 6),
-        cat_token=getattr(args, "dino_cat_token", True),
-        include_camera_enc=getattr(args, "dino_camera_enc", True),
-        max_cams=max(2, getattr(args, "num_side_cam", 2)),
-        use_plucker=getattr(args, "use_plucker", False),
-        plucker_vit_embed_dim=getattr(args, "plucker_vit_embed_dim", 384),
-        plucker_vit_depth=getattr(args, "plucker_vit_depth", 4),
-        plucker_vit_num_heads=getattr(args, "plucker_vit_num_heads", 6),
-        plucker_vit_mlp_ratio=getattr(args, "plucker_vit_mlp_ratio", 4.0),
+        crop_shape=(224, 224),
+        max_cams=max(2, args.num_side_cam),
+        model_name="facebook/dinov2-base",
+        num_unfrozen_blocks=8,
+        plucker_vit_embed_dim=384,
+        plucker_vit_depth=4,
+        plucker_vit_num_heads=6,
+        plucker_vit_mlp_ratio=4.0,
     )
 
     transformer = Transformer(
