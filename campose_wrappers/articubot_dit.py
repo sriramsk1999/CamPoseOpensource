@@ -359,20 +359,36 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
         return policy.action_decoder(dit_out)
 
 
-class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
-    """Trains FlowMatchingDiTImagePolicy with single-view DINOv2 + Plucker ViT.
+_DINOV2_BARE_CFG = {
+    "model_name": "facebook/dinov2-base",
+    "frozen": True,
+    "num_unfrozen_blocks": 8,
+}
 
-    Each camera is encoded independently by a partially fine-tuned DINOv2 (last
-    8 transformer blocks + final LN unfrozen). Plucker rays are encoded by a
-    sibling small ViT and fused token-wise before the projector. No cross-view
-    attention; cross-view fusion is the contribution this baseline ablates.
+
+class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
+    """Trains FlowMatchingDiTImagePolicy with single-view DINOv2.
+
+    With ``use_plucker=True`` (default, GROOT-DINO-SV-Plucker): each camera is
+    encoded by a partially fine-tuned DINOv2; sibling Plucker ViT tokens are
+    fused token-wise before the projector.
+
+    With ``use_plucker=False`` (canonical-view baseline, GROOT-DINO-SV): just
+    the partially fine-tuned DINOv2; no plucker stream, no fusion. Pair with
+    the canonical-view dataloader path so input RGB already encodes the scene
+    from a fixed viewpoint.
     """
+
+    def __init__(self, *args, use_plucker: bool = True, **kwargs):
+        self._use_plucker = use_plucker
+        super().__init__(*args, **kwargs)
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
         obs = {}
         for i in range(num_cams):
             obs[f"cam{i}_image"] = {"shape": [3, image_size, image_size], "type": "rgb"}
-            obs[f"cam{i}_plucker"] = {"shape": [6, image_size, image_size], "type": "plucker"}
+            if self._use_plucker:
+                obs[f"cam{i}_plucker"] = {"shape": [6, image_size, image_size], "type": "plucker"}
         obs["state"] = {"shape": [state_dim], "type": "low_dim"}
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
@@ -380,13 +396,15 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
         from diffusion_policy.policy.flow_matching_dit_image_policy import (
             FlowMatchingDiTImagePolicy,
         )
+        encoder_type = "dinov2_plucker" if self._use_plucker else "dinov2"
+        encoder_cfg = dict(_DINOV2_PLUCKER_CFG if self._use_plucker else _DINOV2_BARE_CFG)
         return FlowMatchingDiTImagePolicy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
-            visual_encoder_type="dinov2_plucker",
-            visual_encoder_cfg=dict(_DINOV2_PLUCKER_CFG),
+            visual_encoder_type=encoder_type,
+            visual_encoder_cfg=encoder_cfg,
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
@@ -395,6 +413,8 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
         )
 
     def _add_geometry_obs(self, obs, batch, n_cams):
+        if not self._use_plucker:
+            return
         # Channels 3-9 of the CamPose-loader 9-channel image are 6-D Plucker rays.
         plucker = batch["image"][:, :, 3:9]      # (B, n_cams, 6, H, W)
         for i in range(n_cams):

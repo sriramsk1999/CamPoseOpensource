@@ -13,7 +13,8 @@ from cam_embedding import PluckerEmbedder
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv, invert_pose
+from policy_common.canonical_view import fuse_and_render
 from policy_common.paired_crop import adjust_intrinsic
 
 def to_mp4(save_path, image_list, reward_list=None, success_list=None, info_list=None):
@@ -107,6 +108,7 @@ class Evaluator:
         self.is_dino = getattr(args, 'policy_class', '') in (
             'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
         )
+        self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2
         self.crop_left = (self.W - self.crop_dst) // 2
@@ -125,6 +127,26 @@ class Evaluator:
                 print(f"Loaded {len(raw['poses'])} camera poses (old format) from {poses_path}; key={pose_name}; num_side_cam={self.num_side_cam}")
         else:
             print("Evaluator: default_cam=True; using agentview pose duplicated if needed")
+
+        # Canonical-view baselines: fix the OUTPUT viewpoints to the first
+        # num_side_cam entries of args.train_poses_file. Must match the
+        # canonical poses used during training (dataloader picks the same).
+        if self.use_canonical_views:
+            assert not args.default_cam, (
+                "canonical-view baselines require a camera_poses file"
+            )
+            train_poses_path = os.path.join(camera_poses_dir, args.train_poses_file)
+            with open(train_poses_path, 'r') as f:
+                train_raw = json.load(f)
+            train_poses = train_raw['poses']
+            self.canonical_c2ws_gl = [
+                np.array(train_poses[i], dtype=np.float32)
+                for i in range(self.num_side_cam)
+            ]
+            self.canonical_w2cs = [
+                invert_pose(c2w_opengl_to_opencv(c2w_gl))
+                for c2w_gl in self.canonical_c2ws_gl
+            ]
 
         # Detect action space from dataset metadata
         with h5py.File(dataset_path, 'r') as f:
@@ -177,6 +199,17 @@ class Evaluator:
 
     def _render_cam_rgbd(self, cam_pose_raw):
         """Render RGB + world-frame pointmap at 256x256. Returns (rgb, pointmap, c2w)."""
+        rgb, depth_m, cam_pose, far = self._render_cam_rgb_depth(cam_pose_raw)
+        # Pose files + mujoco cam_quat are GL convention (camera looks down -Z).
+        # backproject assumes OpenCV (+Z forward), so convert.
+        pointmap = backproject(
+            depth_m, self.intrinsics, c2w_opengl_to_opencv(cam_pose),
+            invalid_value=0.0, max_depth=far * 0.99,
+        )
+        return rgb, pointmap, cam_pose
+
+    def _render_cam_rgb_depth(self, cam_pose_raw):
+        """Render RGB + metric depth. Returns (rgb, depth_m, c2w_gl, far)."""
         if cam_pose_raw is not None:
             cam_pose = np.array(cam_pose_raw, dtype=np.float32)
             self._set_camera_pose(cam_pose)
@@ -196,13 +229,8 @@ class Evaluator:
         near = float(self.env.sim.model.vis.map.znear * extent)
         far = float(self.env.sim.model.vis.map.zfar * extent)
         depth_m = mujoco_metric_depth(depth_norm, near, far)
-        # Pose files + mujoco cam_quat are GL convention (camera looks down -Z).
-        # backproject assumes OpenCV (+Z forward), so convert.
-        pointmap = backproject(
-            depth_m, self.intrinsics, c2w_opengl_to_opencv(cam_pose),
-            invalid_value=0.0, max_depth=far * 0.99,
-        )
-        return rgb, pointmap, cam_pose
+        depth_m[depth_m > far * 0.99] = 0.0
+        return rgb, depth_m, cam_pose, far
 
     def _legacy_cam_extrinsics(self, pose_set):
         """Build the [1, 2, 4, 4] cam_extrinsics field ACT/DP/SmolVLA expect."""
@@ -222,6 +250,52 @@ class Evaluator:
                 self.env.robots[0].eef_site_id[self.env.robots[0].arms[0]]
             ], dtype=np.float32)
         ).unsqueeze(0).cuda()
+
+    def _build_canonical_batch(self, pose_set, drop_proprio=False):
+        """Render each chosen camera's RGB+depth, fuse, splat into canonical views.
+
+        Returns the same dict shape as _build_pointmap_batch but with 3-channel
+        canonical RGBs in 'image' and a zero pointmap (placeholder; canonical
+        baselines don't consume it).
+        """
+        top, left, dst = self.crop_top, self.crop_left, self.crop_dst
+        input_rgbs, input_depths_m, input_c2ws_cv = [], [], []
+        for p in pose_set:
+            rgb, depth_m, cam_pose, _ = self._render_cam_rgb_depth(p)
+            input_rgbs.append(rgb)
+            input_depths_m.append(depth_m)
+            input_c2ws_cv.append(c2w_opengl_to_opencv(cam_pose))
+
+        canonical_rgbs = fuse_and_render(
+            input_rgbs, input_depths_m,
+            [self.intrinsics] * len(pose_set), input_c2ws_cv,
+            self.canonical_w2cs, [self.intrinsics] * self.num_side_cam,
+            H=self.H, W=self.W,
+        )
+
+        imgs, pms, extrs = [], [], []
+        for i, canonical_rgb in enumerate(canonical_rgbs):
+            rgb_t = einops.rearrange(
+                torch.from_numpy(canonical_rgb).float() / 255.0,
+                'h w c -> c h w',
+            )
+            imgs.append(rgb_t[:, top:top + dst, left:left + dst])
+            pms.append(torch.zeros(3, dst, dst))
+            extrs.append(torch.from_numpy(self.canonical_c2ws_gl[i]).float())
+
+        n = len(imgs)
+        K_crop_t = torch.from_numpy(self.K_crop).float().unsqueeze(0).expand(n, -1, -1)
+        eef_xyz = self._eef_xyz()
+        if drop_proprio:
+            eef_xyz = torch.zeros_like(eef_xyz)
+        return {
+            'image': torch.stack(imgs, dim=0).unsqueeze(0).cuda(),
+            'pointmap': torch.stack(pms, dim=0).unsqueeze(0).cuda(),
+            'cam_extrinsics_full': torch.stack(extrs, dim=0).unsqueeze(0).cuda(),
+            'cam_intrinsics_full': K_crop_t.unsqueeze(0).cuda(),
+            'eef_xyz': eef_xyz,
+            'cam_extrinsics': self._legacy_cam_extrinsics(pose_set),
+        }, canonical_rgbs
 
     def _build_pointmap_batch(self, per_cam_rgb, per_cam_pointmaps, per_cam_poses, pose_set,
                               drop_proprio=False):
@@ -292,30 +366,39 @@ class Evaluator:
                 pose_set = [poses_list[2 * episode_num], poses_list[2 * episode_num + 1]]
         
         while not done and step < self.max_steps:
-            if self.is_dino:
-                per_cam = [self._render_cam_rgbd(p) for p in pose_set]
-                per_cam_images = [x[0] for x in per_cam]
-                per_cam_pointmaps = [x[1] for x in per_cam]
-                per_cam_poses = [x[2] for x in per_cam]
-            else:
-                per_cam_images = [self._render_cam_image(p) for p in pose_set]
-                per_cam_pointmaps = None
-                per_cam_poses = None
-
-            camera_frame = per_cam_images[0] if len(per_cam_images) == 1 else np.concatenate([per_cam_images[0], per_cam_images[1]], axis=1)
-            camera_frames.append(camera_frame)
-            success_labels.append(has_succeeded)
-
             # One drop draw per step gates both qpos and eef_xyz, matching
             # the dataloader (utils.py: see prob_drop_proprio block).
             drop_proprio = bool(np.random.rand() < self.args.prob_drop_proprio)
 
-            if self.is_dino:
+            if self.use_canonical_views:
+                batch, canonical_rgbs = self._build_canonical_batch(
+                    pose_set, drop_proprio=drop_proprio,
+                )
+                # Save the canonical-view renders to the video instead of the
+                # raw chosen-cam RGBs.
+                camera_frame = (
+                    canonical_rgbs[0] if len(canonical_rgbs) == 1
+                    else np.concatenate([canonical_rgbs[0], canonical_rgbs[1]], axis=1)
+                )
+                camera_frames.append(camera_frame)
+                success_labels.append(has_succeeded)
+            elif self.is_dino:
+                per_cam = [self._render_cam_rgbd(p) for p in pose_set]
+                per_cam_images = [x[0] for x in per_cam]
+                per_cam_pointmaps = [x[1] for x in per_cam]
+                per_cam_poses = [x[2] for x in per_cam]
+                camera_frame = per_cam_images[0] if len(per_cam_images) == 1 else np.concatenate([per_cam_images[0], per_cam_images[1]], axis=1)
+                camera_frames.append(camera_frame)
+                success_labels.append(has_succeeded)
                 batch = self._build_pointmap_batch(
                     per_cam_images, per_cam_pointmaps, per_cam_poses, pose_set,
                     drop_proprio=drop_proprio,
                 )
             else:
+                per_cam_images = [self._render_cam_image(p) for p in pose_set]
+                camera_frame = per_cam_images[0] if len(per_cam_images) == 1 else np.concatenate([per_cam_images[0], per_cam_images[1]], axis=1)
+                camera_frames.append(camera_frame)
+                success_labels.append(has_succeeded)
                 per_cam_tensors = [self._image_to_tensor(img, p) for img, p in zip(per_cam_images, pose_set)]
                 image_tensor = torch.stack(per_cam_tensors, dim=0).unsqueeze(0).cuda()
                 batch = {

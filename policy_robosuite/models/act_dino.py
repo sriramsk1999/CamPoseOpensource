@@ -97,6 +97,7 @@ class BackboneDino(nn.Module):
         max_cams: int = 4,
         model_name: str = "facebook/dinov2-base",
         num_unfrozen_blocks: int = 8,
+        use_plucker: bool = True,
         plucker_vit_embed_dim: int = 384,
         plucker_vit_depth: int = 4,
         plucker_vit_num_heads: int = 6,
@@ -107,6 +108,7 @@ class BackboneDino(nn.Module):
 
         self.crop_h, self.crop_w = crop_shape
         self.num_channels = hidden_dim
+        self.use_plucker = use_plucker
 
         self.dino = AutoModel.from_pretrained(model_name)
         for p in self.dino.parameters():
@@ -139,21 +141,24 @@ class BackboneDino(nn.Module):
             "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
         )
 
-        self.plucker_vit = PluckerViT(
-            crop_shape=crop_shape,
-            patch_size=ps,
-            embed_dim=plucker_vit_embed_dim,
-            depth=plucker_vit_depth,
-            num_heads=plucker_vit_num_heads,
-            mlp_ratio=plucker_vit_mlp_ratio,
-        )
-        assert self.plucker_vit.num_patches == self.num_tokens_per_cam, (
-            f"PluckerViT patch count {self.plucker_vit.num_patches} must match "
-            f"DINO token count {self.num_tokens_per_cam}"
-        )
-        self.fused_projector = nn.Linear(
-            self.token_dim + plucker_vit_embed_dim, hidden_dim,
-        )
+        if use_plucker:
+            self.plucker_vit = PluckerViT(
+                crop_shape=crop_shape,
+                patch_size=ps,
+                embed_dim=plucker_vit_embed_dim,
+                depth=plucker_vit_depth,
+                num_heads=plucker_vit_num_heads,
+                mlp_ratio=plucker_vit_mlp_ratio,
+            )
+            assert self.plucker_vit.num_patches == self.num_tokens_per_cam, (
+                f"PluckerViT patch count {self.plucker_vit.num_patches} must match "
+                f"DINO token count {self.num_tokens_per_cam}"
+            )
+            self.fused_projector = nn.Linear(
+                self.token_dim + plucker_vit_embed_dim, hidden_dim,
+            )
+        else:
+            self.projector = nn.Linear(self.token_dim, hidden_dim)
 
         self.pos_embed = nn.Embedding(max_cams * self.num_tokens_per_cam, hidden_dim)
         nn.init.normal_(self.pos_embed.weight, std=0.02)
@@ -161,23 +166,22 @@ class BackboneDino(nn.Module):
     def forward(self, images, extrinsics=None, intrinsics=None):
         """
         Args:
-            images: (B, num_cam, 9, H, W) — channels [0:3] RGB in [0,1],
-                    channels [3:9] Plucker rays.
-            extrinsics/intrinsics: accepted for call-site parity with the
-                    legacy cross-view path; ignored here (single-view encoder
-                    has no use for camera geometry).
+            images: (B, num_cam, C, H, W). C=9 (3 RGB + 6 Plucker) when
+                    ``use_plucker=True``; C=3 (RGB only) when False (e.g.
+                    canonical-view baseline).
+            extrinsics/intrinsics: accepted for call-site parity; ignored.
         Returns:
             features  : (B, num_cam * num_tokens_per_cam, hidden_dim)
             pos_embed : (B, num_cam * num_tokens_per_cam, hidden_dim)
         """
         del extrinsics, intrinsics
         b, s = images.shape[:2]
-        assert images.size(2) == 9, (
-            f"act_dino expects 9-channel images (3 RGB + 6 Plucker), "
-            f"got {images.size(2)}"
+        expected_c = 9 if self.use_plucker else 3
+        assert images.size(2) == expected_c, (
+            f"act_dino (use_plucker={self.use_plucker}) expects {expected_c}-channel "
+            f"images, got {images.size(2)}"
         )
         rgb = images[:, :, :3]
-        plucker = images[:, :, 3:9]
         assert rgb.shape[-2:] == (self.crop_h, self.crop_w), (
             f"act_dino expects pre-cropped ({self.crop_h}x{self.crop_w}) images, "
             f"got {tuple(rgb.shape[-2:])}"
@@ -189,9 +193,13 @@ class BackboneDino(nn.Module):
         tokens = out.last_hidden_state[:, 1:]  # drop CLS
         tokens = rearrange(tokens, "(b s) n d -> b s n d", b=b, s=s)
 
-        plucker_tokens = self.plucker_vit(plucker)              # (B, S, N_tok, plk_dim)
-        fused = torch.cat([tokens, plucker_tokens], dim=-1)
-        tokens = self.fused_projector(fused)                    # (B, S, N_tok, hidden_dim)
+        if self.use_plucker:
+            plucker = images[:, :, 3:9]
+            plucker_tokens = self.plucker_vit(plucker)              # (B, S, N_tok, plk_dim)
+            fused = torch.cat([tokens, plucker_tokens], dim=-1)
+            tokens = self.fused_projector(fused)                    # (B, S, N_tok, hidden_dim)
+        else:
+            tokens = self.projector(tokens)                          # (B, S, N_tok, hidden_dim)
 
         features = rearrange(tokens, "b s n d -> b (s n) d")
         total_len = features.shape[1]
@@ -299,15 +307,16 @@ class DETRVAEDino(nn.Module):
 
 
 def build_dino(args):
-    # Visual-encoder + Plucker-ViT hyperparameters are hardcoded — they are
-    # tied to the architecture choice (ACT-DINO-SV-Plucker), not training-time
-    # knobs. Tune via source edit if needed.
+    # use_plucker comes from the existing --use_plucker CLI flag (act_dino +
+    # plucker vs --use_canonical_views which forces plucker off). Other knobs
+    # are tied to architecture choice; tune via source edit.
     backbone = BackboneDino(
         hidden_dim=args.hidden_dim,
         crop_shape=(224, 224),
         max_cams=max(2, args.num_side_cam),
         model_name="facebook/dinov2-base",
         num_unfrozen_blocks=8,
+        use_plucker=args.use_plucker,
         plucker_vit_embed_dim=384,
         plucker_vit_depth=4,
         plucker_vit_num_heads=6,

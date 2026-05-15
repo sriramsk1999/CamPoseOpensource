@@ -19,8 +19,9 @@ from eval import to_mp4
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 sys.path.insert(0, _REPO_ROOT)
-from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv
+from policy_common.pointmap import mujoco_metric_depth, backproject, pose_from_pos_ori, c2w_opengl_to_opencv, invert_pose
 from policy_common.paired_crop import PairedRandomCrop, adjust_intrinsic
+from policy_common.canonical_view import fuse_and_render
 
 # --- Utility Functions ---
 
@@ -279,6 +280,7 @@ class EpisodicDataset(Dataset):
         self.is_dino = args.policy_class in (
             'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
         )
+        self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         
         if not self.args.default_cam:
@@ -286,11 +288,39 @@ class EpisodicDataset(Dataset):
             with open(poses_path, 'r') as f:
                 raw = json.load(f)
             self.camera_poses = raw['poses']
-            
+
             print(f"Loaded {len(self.camera_poses)} camera poses (old format) from {poses_path}; num_side_cam={self.num_cameras}")
         else:
             # self.camera_poses = None
             print("Using default agentview camera pose (duplicated if multiple cams)")
+
+        # Canonical-view baselines: fix the OUTPUT viewpoints to the first
+        # num_side_cam entries of the TRAIN pose file (not self.camera_poses,
+        # which may be the val/test set). Train and val/eval must share
+        # canonical poses or the model trains on one viewpoint and is tested
+        # on another.
+        if self.use_canonical_views:
+            assert not self.args.default_cam, (
+                "canonical-view baselines require a camera_poses file (got default_cam=True)"
+            )
+            train_poses_path = os.path.join(
+                self.args.camera_poses_dir, self.args.train_poses_file,
+            )
+            with open(train_poses_path, 'r') as f:
+                train_raw = json.load(f)
+            train_poses = train_raw['poses']
+            assert len(train_poses) >= self.num_cameras, (
+                f"need at least {self.num_cameras} train_cameras poses for "
+                f"canonical views, got {len(train_poses)}"
+            )
+            self.canonical_c2ws_gl = [
+                np.array(train_poses[i], dtype=np.float32)
+                for i in range(self.num_cameras)
+            ]
+            self.canonical_w2cs = [
+                invert_pose(c2w_opengl_to_opencv(c2w_gl))
+                for c2w_gl in self.canonical_c2ws_gl
+            ]
         
         if self.use_plucker:
             self.plucker_embedder = PluckerEmbedder(img_size=self.image_size, device='cuda')
@@ -406,6 +436,53 @@ class EpisodicDataset(Dataset):
             pose_set = [None] * self.args.num_side_cam
 
         K_base = self._get_camera_intrinsics()  # (3,3) for the uncropped 256 image
+
+        if self.use_canonical_views:
+            # Render each chosen-camera RGB+depth, fuse pointclouds, splat into
+            # num_side_cam canonical viewpoints. The model sees a fixed set of
+            # canonical views regardless of which physical cameras were chosen.
+            near, far = self._mujoco_near_far()
+            input_rgbs, input_depths_m, input_c2ws_cv = [], [], []
+            for cam_pose_raw in pose_set:
+                cam_pose = np.array(cam_pose_raw, dtype=np.float32)  # c2w GL
+                self._set_camera_pose(cam_pose)
+                self.env.sim.forward()
+                rgb_img, depth_norm = self.env.sim.render(
+                    camera_name="agentview", height=self.image_size,
+                    width=self.image_size, depth=True,
+                )
+                rgb_img = np.flipud(rgb_img).copy()
+                depth_norm = np.flipud(depth_norm).copy()
+                depth_m = mujoco_metric_depth(depth_norm, near, far)
+                depth_m[depth_m > far * 0.99] = 0.0
+                input_rgbs.append(rgb_img)
+                input_depths_m.append(depth_m)
+                input_c2ws_cv.append(c2w_opengl_to_opencv(cam_pose))
+
+            canonical_rgbs = fuse_and_render(
+                input_rgbs, input_depths_m,
+                [K_base] * len(pose_set), input_c2ws_cv,
+                self.canonical_w2cs, [K_base] * self.num_cameras,
+                H=self.image_size, W=self.image_size,
+            )
+            for i, canonical_rgb in enumerate(canonical_rgbs):
+                rgb_tensor = einops.rearrange(
+                    torch.from_numpy(canonical_rgb).float() / 255.0,
+                    'h w c -> c h w',
+                ).cuda()
+                rgb_c = self._paired_crop(rgb_tensor)
+                top, left = self._paired_crop.offsets()
+                K_c = adjust_intrinsic(K_base, top, left)
+                cam_images.append(rgb_c)  # 3-channel; no plucker
+                # Zero pointmap placeholder — canonical baselines do not consume it.
+                cam_pointmaps.append(
+                    torch.zeros(3, rgb_c.shape[1], rgb_c.shape[2], device='cuda')
+                )
+                cam_extrinsics_out.append(
+                    torch.from_numpy(self.canonical_c2ws_gl[i]).float().cuda()
+                )
+                cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
+            pose_set = []  # skip the per-input-camera loop below
 
         for cam_pose_raw in pose_set:
             if not self.args.default_cam:

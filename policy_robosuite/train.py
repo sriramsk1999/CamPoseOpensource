@@ -77,6 +77,14 @@ def main(args, ckpt=None):
 
     evaluator = Evaluator(env=env, norm_stats=stats, dataset_path=args.dataset_path, args=args)
 
+    # Canonical-view baselines (ACT-DINO-SV / GROOT-DINO-SV) drop plucker —
+    # the canonical RGB itself encodes the geometry, so plucker is redundant.
+    if args.use_canonical_views:
+        assert not args.use_plucker, (
+            "--use_canonical_views=1 implies --use_plucker=0 (canonical RGB "
+            "replaces plucker as the geometric signal)"
+        )
+
     if args.policy_class == 'act':
         policy = ACTPolicy(args).cuda()
     elif args.policy_class == 'act_dino':
@@ -87,18 +95,20 @@ def main(args, ckpt=None):
         policy = SmolVLAPolicyWrapper(args).cuda()
     elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv'):
         # Robosuite Panda: eef_xyz(3) + qpos(7) = 10-dim state.
-        wrapper_cls = {
-            'dit_rope4d_dino_cv': ArticubotRoPE4DWrapper,
-            'dit_dino_sv':        ArticubotDiTSingleViewWrapper,
-        }[args.policy_class]
-        policy = wrapper_cls(
+        kwargs = dict(
             args=args,
             state_dim=3 + 7,
             action_dim=args.action_dim,
             num_cams=args.num_side_cam,
             image_size=224,
             norm_stats=stats,
-        ).cuda()
+        )
+        if args.policy_class == 'dit_rope4d_dino_cv':
+            policy = ArticubotRoPE4DWrapper(**kwargs).cuda()
+        else:
+            policy = ArticubotDiTSingleViewWrapper(
+                use_plucker=args.use_plucker, **kwargs,
+            ).cuda()
 
     optimizer = policy.configure_optimizers()
 
@@ -266,6 +276,10 @@ if __name__ == '__main__':
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=False, type=str2bool, help='use Plucker embeddings')
+    parser.add_argument('--use_canonical_views', default=False, type=str2bool,
+                        help='reproject input cams into fixed canonical views in '
+                             'the dataloader/eval (ACT-DINO-SV and GROOT-DINO-SV '
+                             'baselines). Implies --use_plucker 0.')
 
     # Camera pose config
     parser.add_argument('--train_poses_file', type=str, default='train_cameras.json', help='Path to training camera poses JSON (old flat format)')
