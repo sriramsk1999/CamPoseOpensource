@@ -105,8 +105,11 @@ class Evaluator:
         # Crop constants are static (center crop), so precompute them once.
         # All DiT + act_dino paths share the 256→224 paired-crop, adjusted K,
         # and emit a pointmap. act_dino and dit_dino_* simply ignore it.
+        # flow_matching_3dfa shares the 224-paired-crop + pointmap pipeline
+        # even though it's not a DINO policy.
         self.is_dino = getattr(args, 'policy_class', '') in (
             'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
+            'flow_matching_3dfa',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         self.crop_dst = 224

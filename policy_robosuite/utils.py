@@ -277,8 +277,11 @@ class EpisodicDataset(Dataset):
         # 224 crop and depth-derived pointmap path; legacy policies keep the
         # 256 path. act_dino consumes the same 224-cropped RGB (+Plucker) and
         # simply ignores the pointmap field.
+        # Note: flow_matching_3dfa isn't a DINO policy but reuses the same
+        # 224-paired-crop + pointmap pipeline.
         self.is_dino = args.policy_class in (
             'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
+            'flow_matching_3dfa',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)

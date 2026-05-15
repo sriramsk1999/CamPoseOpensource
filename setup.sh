@@ -22,7 +22,10 @@ pip install numpy scipy h5py einops pillow tqdm imageio imageio-ffmpeg PyOpenGL 
 
 pip install diffusers transformers
 
-pip install mujoco 
+# OpenAI CLIP — needed by ArticuBot's 3DFA encoder (flowmatch_3dfa).
+pip install "git+https://github.com/openai/CLIP.git"
+
+pip install mujoco
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
