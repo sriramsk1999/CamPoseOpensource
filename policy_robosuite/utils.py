@@ -281,9 +281,12 @@ class EpisodicDataset(Dataset):
         # 224-paired-crop + pointmap pipeline.
         self.is_dino = args.policy_class in (
             'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
-            'flow_matching_3dfa',
+            'flow_matching_3dfa', 'dit_maniwhere_sv',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
+        # ManiWhere baseline path: per-cam render also emits a fixed-view
+        # RGB-D image (cam{i}_fixed_image) for the contrastive/L2 aux loss.
+        self.use_maniwhere_aux = args.policy_class == 'dit_maniwhere_sv'
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         
         if not self.args.default_cam:
@@ -297,12 +300,12 @@ class EpisodicDataset(Dataset):
             # self.camera_poses = None
             print("Using default agentview camera pose (duplicated if multiple cams)")
 
-        # Canonical-view baselines: fix the OUTPUT viewpoints to the first
-        # num_side_cam entries of the TRAIN pose file (not self.camera_poses,
-        # which may be the val/test set). Train and val/eval must share
-        # canonical poses or the model trains on one viewpoint and is tested
-        # on another.
-        if self.use_canonical_views:
+        # Canonical-view + ManiWhere baselines: fix the reference viewpoints
+        # to the first num_side_cam entries of the TRAIN pose file (not
+        # self.camera_poses, which may be the val/test set). Train and
+        # val/eval must share these or the model trains on one viewpoint and
+        # is tested on another. Same logic for both flags.
+        if self.use_canonical_views or self.use_maniwhere_aux:
             assert not self.args.default_cam, (
                 "canonical-view baselines require a camera_poses file (got default_cam=True)"
             )
@@ -406,6 +409,29 @@ class EpisodicDataset(Dataset):
         far = self.env.sim.model.vis.map.zfar * extent
         return float(near), float(far)
 
+    def _render_rgbd(self, cam_pose_gl, depth_max):
+        """Render the agentview at cam_pose_gl and return a (4, H, W) RGBD tensor.
+
+        RGB is in [0, 1]; depth is clipped to ``[0, depth_max]`` then divided
+        by ``depth_max`` so it lands in [0, 1] alongside the RGB channels. Used
+        by the ManiWhere baseline path.
+        """
+        self._set_camera_pose(cam_pose_gl)
+        self.env.sim.forward()
+        rgb_img, depth_norm = self.env.sim.render(
+            camera_name="agentview", height=self.image_size,
+            width=self.image_size, depth=True,
+        )
+        rgb_img = np.flipud(rgb_img).copy()
+        depth_norm = np.flipud(depth_norm).copy()
+        near, far = self._mujoco_near_far()
+        depth_m = mujoco_metric_depth(depth_norm, near, far)
+        depth_m = np.clip(depth_m, 0.0, depth_max) / depth_max  # → [0, 1]
+        rgb_t = torch.from_numpy(rgb_img).float() / 255.0          # (H, W, 3)
+        d_t = torch.from_numpy(depth_m).float().unsqueeze(-1)      # (H, W, 1)
+        rgbd = torch.cat([rgb_t, d_t], dim=-1)                     # (H, W, 4)
+        return einops.rearrange(rgbd, 'h w c -> c h w').cuda()
+
     def _get_eef_xyz_world(self):
         arm = self.env.robots[0].arms[0]
         site_id = self.env.robots[0].eef_site_id[arm]
@@ -484,6 +510,36 @@ class EpisodicDataset(Dataset):
                 cam_extrinsics_out.append(
                     torch.from_numpy(self.canonical_c2ws_gl[i]).float().cuda()
                 )
+                cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
+            pose_set = []  # skip the per-input-camera loop below
+
+        # ManiWhere baseline (dit_maniwhere_sv): each chosen cam emits a
+        # (RGB+normalized depth) 4-channel image, AND a paired fixed-view
+        # 4-channel image rendered at the canonical pose for that slot.
+        # Both pairs go through the same paired_crop offset so the encoder's
+        # spatial tokens stay aligned.
+        cam_images_fixed = []
+        if self.use_maniwhere_aux:
+            near, far = self._mujoco_near_far()
+            depth_max = float(far * 0.99)
+            for i, cam_pose_raw in enumerate(pose_set):
+                # Move view (chosen pose)
+                move_pose = np.array(cam_pose_raw, dtype=np.float32)
+                move_rgbd = self._render_rgbd(move_pose, depth_max)
+                # Fixed view (canonical pose for slot i)
+                fix_rgbd = self._render_rgbd(self.canonical_c2ws_gl[i], depth_max)
+                # Same crop offsets for both (one paired_crop per __getitem__).
+                move_c = self._paired_crop(move_rgbd)
+                fix_c = self._paired_crop(fix_rgbd)
+                top, left = self._paired_crop.offsets()
+                K_c = adjust_intrinsic(K_base, top, left)
+                cam_images.append(move_c)
+                cam_images_fixed.append(fix_c)
+                # Zero pointmap placeholder (ManiWhere doesn't consume pointmap).
+                cam_pointmaps.append(
+                    torch.zeros(3, move_c.shape[1], move_c.shape[2], device='cuda')
+                )
+                cam_extrinsics_out.append(torch.from_numpy(move_pose).float().cuda())
                 cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
             pose_set = []  # skip the per-input-camera loop below
 
@@ -605,6 +661,9 @@ class EpisodicDataset(Dataset):
         }
         if self.is_dino:
             out['pointmap'] = torch.stack(cam_pointmaps, dim=0)  # (num_cams, 3, H, W)
+        if self.use_maniwhere_aux:
+            # Fixed reference views for ManiWhere's contrastive/L2 aux loss.
+            out['image_fixed'] = torch.stack(cam_images_fixed, dim=0)  # (num_cams, 4, H, W)
         return out
 
     def __del__(self):

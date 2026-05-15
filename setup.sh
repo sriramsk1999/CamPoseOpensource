@@ -25,6 +25,9 @@ pip install diffusers transformers
 # OpenAI CLIP — needed by ArticuBot's 3DFA encoder (flowmatch_3dfa).
 pip install "git+https://github.com/openai/CLIP.git"
 
+# Kornia — perspective warp for ArticuBot's ManiWhere STN module.
+pip install kornia
+
 pip install mujoco
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"

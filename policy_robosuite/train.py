@@ -26,6 +26,7 @@ from campose_wrappers.articubot_dit import (
     ArticubotDiTSingleViewWrapper,
 )
 from campose_wrappers.articubot_3dfa import Articubot3DFAWrapper
+from campose_wrappers.articubot_maniwhere import ArticubotManiWhereWrapper
 
 import wandb
 
@@ -94,7 +95,8 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
-    elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv', 'flow_matching_3dfa'):
+    elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv',
+                               'flow_matching_3dfa', 'dit_maniwhere_sv'):
         # Robosuite Panda: eef_xyz(3) + qpos(7) = 10-dim state.
         kwargs = dict(
             args=args,
@@ -108,6 +110,8 @@ def main(args, ckpt=None):
             policy = ArticubotRoPE4DWrapper(**kwargs).cuda()
         elif args.policy_class == 'flow_matching_3dfa':
             policy = Articubot3DFAWrapper(**kwargs).cuda()
+        elif args.policy_class == 'dit_maniwhere_sv':
+            policy = ArticubotManiWhereWrapper(**kwargs).cuda()
         else:
             policy = ArticubotDiTSingleViewWrapper(
                 use_plucker=args.use_plucker, **kwargs,
@@ -118,6 +122,7 @@ def main(args, ckpt=None):
     # Flow-matching DiT policies use EMA.
     use_ema = args.policy_class in (
         'dit_rope4d_dino_cv', 'dit_dino_sv', 'flow_matching_3dfa',
+        'dit_maniwhere_sv',
     )
     ema = None
     eval_policy = policy
@@ -275,7 +280,7 @@ if __name__ == '__main__':
     parser.add_argument('--policy_class', type=str, default='act',
                         choices=['dp', 'act', 'smolvla', 'act_dino',
                                  'dit_rope4d_dino_cv', 'dit_dino_sv',
-                                 'flow_matching_3dfa'],
+                                 'flow_matching_3dfa', 'dit_maniwhere_sv'],
                         help='policy class')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
