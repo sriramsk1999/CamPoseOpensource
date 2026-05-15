@@ -108,10 +108,13 @@ class Evaluator:
         # flow_matching_3dfa + dit_maniwhere_sv aren't DINO policies but reuse
         # the 224-paired-crop + depth-rendering pipeline.
         self.is_dino = getattr(args, 'policy_class', '') in (
-            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino',
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino_sv',
             'flow_matching_3dfa', 'dit_maniwhere_sv',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
+        # ManiWhere baseline: render move + fixed RGBD pairs at eval time, same
+        # convention as the dataloader (utils.py:use_maniwhere_aux).
+        self.use_maniwhere_aux = getattr(args, 'policy_class', '') == 'dit_maniwhere_sv'
         self.crop_dst = 224
         self.crop_top = (self.H - self.crop_dst) // 2
         self.crop_left = (self.W - self.crop_dst) // 2
@@ -131,12 +134,12 @@ class Evaluator:
         else:
             print("Evaluator: default_cam=True; using agentview pose duplicated if needed")
 
-        # Canonical-view baselines: fix the OUTPUT viewpoints to the first
-        # num_side_cam entries of args.train_poses_file. Must match the
-        # canonical poses used during training (dataloader picks the same).
-        if self.use_canonical_views:
+        # Canonical-view + ManiWhere baselines: fix the reference viewpoints to
+        # the first num_side_cam entries of args.train_poses_file. Must match
+        # the poses used during training (dataloader picks the same).
+        if self.use_canonical_views or self.use_maniwhere_aux:
             assert not args.default_cam, (
-                "canonical-view baselines require a camera_poses file"
+                "canonical-view / maniwhere baselines require a camera_poses file"
             )
             train_poses_path = os.path.join(camera_poses_dir, args.train_poses_file)
             with open(train_poses_path, 'r') as f:
@@ -211,6 +214,19 @@ class Evaluator:
         )
         return rgb, pointmap, cam_pose
 
+    def _render_cam_rgbd_4ch(self, cam_pose_gl, depth_max):
+        """Return a (4, 256, 256) RGBD CUDA tensor for the ManiWhere baseline.
+
+        Mirrors utils.py:_render_rgbd. RGB in [0,1]; depth clipped to
+        [0, depth_max] and divided by depth_max so it sits alongside RGB.
+        """
+        rgb, depth_m, _, _ = self._render_cam_rgb_depth(cam_pose_gl)
+        depth_norm = np.clip(depth_m, 0.0, depth_max) / depth_max
+        rgb_t = torch.from_numpy(rgb).float() / 255.0          # (H, W, 3)
+        d_t = torch.from_numpy(depth_norm).float().unsqueeze(-1)  # (H, W, 1)
+        rgbd = torch.cat([rgb_t, d_t], dim=-1)                 # (H, W, 4)
+        return einops.rearrange(rgbd, 'h w c -> c h w')        # (4, H, W) cpu
+
     def _render_cam_rgb_depth(self, cam_pose_raw):
         """Render RGB + metric depth. Returns (rgb, depth_m, c2w_gl, far)."""
         if cam_pose_raw is not None:
@@ -253,6 +269,54 @@ class Evaluator:
                 self.env.robots[0].eef_site_id[self.env.robots[0].arms[0]]
             ], dtype=np.float32)
         ).unsqueeze(0).cuda()
+
+    def _build_maniwhere_batch(self, pose_set, drop_proprio=False):
+        """Render move+fixed RGBD pairs and stack into the ManiWhere batch.
+
+        Returns:
+            batch: dict with the same shape as _build_pointmap_batch but with
+                'image' (1, n_cams, 4, dst, dst) RGBD at chosen poses and
+                'image_fixed' (1, n_cams, 4, dst, dst) RGBD at canonical poses.
+                Pointmap stays a zero placeholder (ManiWhere doesn't read it).
+            move_rgbs_uncropped: list of (256, 256, 3) uint8 RGB at the chosen
+                poses, for the video writer (matches the per-action sub-loop's
+                _render_cam_image output shape so to_mp4 doesn't choke on mixed
+                frame sizes).
+        """
+        top, left, dst = self.crop_top, self.crop_left, self.crop_dst
+        extent = self.env.sim.model.stat.extent
+        far = float(self.env.sim.model.vis.map.zfar * extent)
+        depth_max = far * 0.99
+
+        move_imgs, fix_imgs, extrs, move_rgbs_uncropped = [], [], [], []
+        for i, p in enumerate(pose_set):
+            move_pose = np.array(p, dtype=np.float32) if p is not None else None
+            move_rgbd = self._render_cam_rgbd_4ch(move_pose, depth_max)         # (4, 256, 256)
+            fix_rgbd = self._render_cam_rgbd_4ch(self.canonical_c2ws_gl[i], depth_max)
+            move_imgs.append(move_rgbd[:, top:top + dst, left:left + dst])
+            fix_imgs.append(fix_rgbd[:, top:top + dst, left:left + dst])
+            # Uncropped RGB at the move pose for the video.
+            rgb_uint8 = (move_rgbd[:3].numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            move_rgbs_uncropped.append(rgb_uint8)
+            extrs.append(torch.from_numpy(move_pose).float() if move_pose is not None
+                         else torch.zeros(4, 4))
+
+        n = len(move_imgs)
+        K_crop_t = torch.from_numpy(self.K_crop).float().unsqueeze(0).expand(n, -1, -1)
+        eef_xyz = self._eef_xyz()
+        if drop_proprio:
+            eef_xyz = torch.zeros_like(eef_xyz)
+        zero_pm = torch.zeros(n, 3, dst, dst)
+        batch = {
+            'image':              torch.stack(move_imgs, dim=0).unsqueeze(0).cuda(),
+            'image_fixed':        torch.stack(fix_imgs, dim=0).unsqueeze(0).cuda(),
+            'pointmap':           zero_pm.unsqueeze(0).cuda(),
+            'cam_extrinsics_full': torch.stack(extrs, dim=0).unsqueeze(0).cuda(),
+            'cam_intrinsics_full': K_crop_t.unsqueeze(0).cuda(),
+            'eef_xyz':            eef_xyz,
+            'cam_extrinsics':     self._legacy_cam_extrinsics(pose_set),
+        }
+        return batch, move_rgbs_uncropped
 
     def _build_canonical_batch(self, pose_set, drop_proprio=False):
         """Render each chosen camera's RGB+depth, fuse, splat into canonical views.
@@ -382,6 +446,18 @@ class Evaluator:
                 camera_frame = (
                     canonical_rgbs[0] if len(canonical_rgbs) == 1
                     else np.concatenate([canonical_rgbs[0], canonical_rgbs[1]], axis=1)
+                )
+                camera_frames.append(camera_frame)
+                success_labels.append(has_succeeded)
+            elif self.use_maniwhere_aux:
+                batch, move_rgbs = self._build_maniwhere_batch(
+                    pose_set, drop_proprio=drop_proprio,
+                )
+                # Uncropped move RGB (256x256x3) so the video frame size matches
+                # what the per-action sub-loop's _render_cam_image emits.
+                camera_frame = (
+                    move_rgbs[0] if len(move_rgbs) == 1
+                    else np.concatenate([move_rgbs[0], move_rgbs[1]], axis=1)
                 )
                 camera_frames.append(camera_frame)
                 success_labels.append(has_succeeded)

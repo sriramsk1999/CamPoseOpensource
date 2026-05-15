@@ -89,7 +89,7 @@ def main(args, ckpt=None):
 
     if args.policy_class == 'act':
         policy = ACTPolicy(args).cuda()
-    elif args.policy_class == 'act_dino':
+    elif args.policy_class == 'act_dino_sv':
         policy = ACTDinoPolicy(args).cuda()
     elif args.policy_class == 'dp':
         policy = DiffusionPolicy(args).cuda()
@@ -278,7 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_robosuite/checkpoints/<name>')
     parser.add_argument('--policy_class', type=str, default='act',
-                        choices=['dp', 'act', 'smolvla', 'act_dino',
+                        choices=['dp', 'act', 'smolvla', 'act_dino_sv',
                                  'dit_rope4d_dino_cv', 'dit_dino_sv',
                                  'flow_matching_3dfa', 'dit_maniwhere_sv'],
                         help='policy class')
