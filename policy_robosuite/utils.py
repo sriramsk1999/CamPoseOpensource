@@ -191,13 +191,22 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
         action_std = np.std(actions_array, axis=0)
         action_std = np.clip(action_std, 1e-4, np.inf)
 
+    # Raw action min/max — consumed by Articubot3DFAWrapper to populate
+    # DenoiseActor3D.workspace_normalizer (which scales raw action deltas
+    # into ~[-1, 1] for RoPE3D-aligned spatial reasoning). Stored for all
+    # policy classes; ignored by non-3DFA wrappers.
+    action_min_raw = actions_array.min(axis=0)
+    action_max_raw = actions_array.max(axis=0)
+
     stats = {
         "state_mean": state_mean,
         "state_std": state_std,
         "action_mean": action_mean,
         "action_std": action_std,
+        "action_min": action_min_raw,
+        "action_max": action_max_raw,
     }
-    
+
     print(f"State Mean shape: {stats['state_mean'].shape}, Action Mean shape: {stats['action_mean'].shape}")
     return stats
 

@@ -27,4 +27,5 @@ python policy_robosuite/train.py \
     --use_plucker 1 --prob_drop_proprio 0 \
     --num_epochs 30001 \
     --eval_start_epoch 0 \
-    --eval_max_steps 600
+    --eval_max_steps 600 \
+    --lr 1e-4 --weight_decay 1e-6 --lr_scheduler cosine

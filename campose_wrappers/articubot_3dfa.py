@@ -13,10 +13,7 @@ Configured for CamPose's 7-dim ``eef_delta`` action via
 import torch
 import torch.nn as nn
 
-from campose_wrappers.articubot_dit import (
-    _ArticubotWrapperBase,
-    _passthrough_normalizer,
-)
+from campose_wrappers.articubot_dit import _ArticubotWrapperBase
 
 
 # Mirror ArticuBot/diffusion_policy/config/train_flow_matching_3dfa_workspace.yaml
@@ -74,6 +71,42 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
             **_TDFA_MODEL_CFG,
         )
 
+    def _post_normalizer_setup(self):
+        """Populate ``DenoiseActor3D.workspace_normalizer`` with raw action
+        min/max. Upstream wires this via ``set_normalizer``; we install the
+        policy normalizer directly (see ``_ArticubotWrapperBase.__init__``),
+        so the buffer would otherwise stay at its default
+        ``[[0,0,0,0,0,0],[1,1,1,1,1,1]]`` — which collapses meter-scale gt
+        deltas to ~-1 in ``normalize_pos`` and breaks the RoPE3D query
+        positions (``unnormalize_pos(noisy) + cumsum`` would live in
+        arbitrary units rather than the pointmap's world frame).
+
+        Note: upstream's ``set_normalizer`` only copies ``[:3]`` (xyz) into
+        the workspace buffer, but for euler the buffer is 6-wide (xyz + 3
+        euler), so doing it ourselves here is also a correctness fix.
+        """
+        norm_stats = self._norm_stats
+        policy = self.policy
+        nrm_dim = int(policy.model.workspace_normalizer.size(-1))
+        action_min = torch.as_tensor(
+            norm_stats["action_min"], dtype=torch.float32,
+        ).reshape(-1)[:nrm_dim]
+        action_max = torch.as_tensor(
+            norm_stats["action_max"], dtype=torch.float32,
+        ).reshape(-1)[:nrm_dim]
+        # Guard against degenerate ranges (zero spread) — replace with ±1
+        # fallback to keep normalize_pos finite.
+        eps = 1e-3
+        spread = action_max - action_min
+        for i in range(nrm_dim):
+            if spread[i].abs() < eps:
+                action_min[i] = -1.0
+                action_max[i] = 1.0
+        with torch.no_grad():
+            policy.model.workspace_normalizer.copy_(
+                torch.stack([action_min, action_max])
+            )
+
     # 3DFA's CLIP encoder expects RGB in [0, 1]; override the base wrapper's
     # [-1, 1] conversion to skip that step. Pointmap is added separately.
     def _build_ab_obs(self, batch, norm_stats):
@@ -112,10 +145,13 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
             return self._predict(batch, norm_stats)
 
         obs = self._build_ab_obs(batch, norm_stats)
-        actions = batch["actions"][:, : self.horizon]
-        assert actions.shape[1] == self.horizon, (
+        actions_raw = self._actions_raw(batch, norm_stats)
+        assert actions_raw.shape[1] == self.horizon, (
             "max_seq_length < horizon — re-export dataset or lower --horizon"
         )
 
-        loss = self.policy.compute_loss({"obs": obs, "action": actions})
+        # 3DFA bypasses ``policy.normalizer`` for actions — its
+        # ``compute_loss`` feeds raw deltas straight to the model, which
+        # runs ``normalize_pos`` against ``workspace_normalizer`` instead.
+        loss = self.policy.compute_loss({"obs": obs, "action": actions_raw})
         return {"loss": loss}

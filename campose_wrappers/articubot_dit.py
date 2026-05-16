@@ -17,7 +17,6 @@ ArticuBot is imported as a sidecar package (no vendoring) — set the
 
 import os
 import sys
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,21 +35,35 @@ def _ensure_articubot_on_path():
         sys.path.insert(0, path)
 
 
-def _passthrough_normalizer(shape_meta):
-    """LinearNormalizer with identity per-field normalization.
+def _build_normalizer(shape_meta, norm_stats):
+    """Build the policy's ``LinearNormalizer``.
+
+    ``action``: real z-score over raw action deltas. With this in place
+       ``policy.normalizer["action"].normalize`` z-scores raw → z-score and
+       ``.unnormalize`` recovers meters, so RoPE4D's cumsum-based action
+       positions land in pointmap world coords without any monkey-patching.
+       ``input_stats`` carries real min/max so 3DFA's ``set_normalizer``
+       path can pull them.
+    obs keys (``state``, images, pointmaps, …): identity passthrough — state
+       mixes meters + radians and the policy reads ``raw_obs["state"][..., :3]``
+       directly for spatial anchors, so z-scoring state would be a net loss.
+
+    Wrapper boundary un-z-scores ``batch["actions"]`` on entry (the
+    dataloader emits z-scored) and re-z-scores the policy's raw-meter
+    output before returning, so the evaluator's ``* std + mean`` step still
+    produces correct raw meters.
 
     IMPORTANT: ``SingleFieldLinearNormalizer.create_manual`` builds an
-    ``nn.ParameterDict`` whose values default to ``requires_grad=True``.
-    Upstream's ``set_normalizer`` path calls ``requires_grad_(False)`` after
-    loading state dict; we replicate that here, otherwise these "stats" end up
-    in ``optimizer.param_groups`` and AdamW + weight_decay slowly drift the
-    scale/offset during training — fits per-step loss, breaks integration.
+    ``nn.ParameterDict`` whose entries default to ``requires_grad=True``.
+    Upstream's ``set_normalizer`` calls ``requires_grad_(False)`` after
+    loading; mirror that or AdamW + weight_decay slowly drift the
+    scale/offset during training (fits per-step loss, breaks integration).
     """
     from diffusion_policy.model.common.normalizer import (
         LinearNormalizer, SingleFieldLinearNormalizer,
     )
 
-    def _identity(shape):
+    def _passthrough(shape):
         shape = tuple(shape)
         scale = torch.ones(shape, dtype=torch.float32)
         offset = torch.zeros(shape, dtype=torch.float32)
@@ -64,10 +77,19 @@ def _passthrough_normalizer(shape_meta):
             scale=scale, offset=offset, input_stats_dict=stats,
         )
 
+    mean = torch.as_tensor(norm_stats["action_mean"], dtype=torch.float32).flatten()
+    std = torch.as_tensor(norm_stats["action_std"], dtype=torch.float32).flatten().clamp_min(1e-6)
+    a_min = torch.as_tensor(norm_stats["action_min"], dtype=torch.float32).flatten()
+    a_max = torch.as_tensor(norm_stats["action_max"], dtype=torch.float32).flatten()
+
     norm = LinearNormalizer()
-    norm["action"] = _identity(shape_meta["action"]["shape"])
+    norm["action"] = SingleFieldLinearNormalizer.create_manual(
+        scale=1.0 / std,
+        offset=-mean / std,
+        input_stats_dict={"mean": mean, "std": std, "min": a_min, "max": a_max},
+    )
     for k, attr in shape_meta["obs"].items():
-        norm[k] = _identity(attr["shape"])
+        norm[k] = _passthrough(attr["shape"])
     norm.requires_grad_(False)
     return norm
 
@@ -163,7 +185,15 @@ class _ArticubotWrapperBase(nn.Module):
         shape_meta = self._build_shape_meta(num_cams, image_size, state_dim, action_dim)
         self._shape_meta = shape_meta
         self.policy = self._build_policy(shape_meta)
-        self.policy.normalizer = _passthrough_normalizer(shape_meta)
+        self.policy.normalizer = _build_normalizer(shape_meta, self._norm_stats)
+        self._post_normalizer_setup()
+
+    def _post_normalizer_setup(self):
+        """Hook for subclasses that need extra setup after the normalizer is
+        installed (e.g. 3DFA's ``workspace_normalizer`` population). No-op
+        by default.
+        """
+        pass
 
     # ------------------------------------------------------------------ #
     # Template methods                                                    #
@@ -178,8 +208,12 @@ class _ArticubotWrapperBase(nn.Module):
         """Insert optional per-cam geometry keys into ``obs``. No-op by default."""
         pass
 
-    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc):
+    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
         """Variant-specific encode → DiT → decoder path.
+
+        ``t_cont`` is the continuous flow-matching time in [0, 1]; passed
+        through so subclasses that build trajectory-aware action positions
+        (RoPE4D) can interpolate gripper_xyz → predicted endpoint.
 
         Returns predicted velocity of shape (B, horizon, action_dim).
         """
@@ -235,6 +269,33 @@ class _ArticubotWrapperBase(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    # Wrapper-boundary normalization helpers                              #
+    # ------------------------------------------------------------------ #
+    def _actions_raw(self, batch, norm_stats):
+        """Undo the dataloader's action z-score so the policy sees raw deltas.
+
+        The dataloader z-scores actions to ``(raw - mean) / std``; the policy
+        carries a real ``LinearNormalizer["action"]`` over raw, so we hand it
+        raw and let the policy re-normalize internally (and unnormalize for
+        RoPE4D's cumsum etc.).
+        """
+        actions = batch["actions"][:, : self.horizon]
+        am = torch.as_tensor(norm_stats["action_mean"], device=actions.device, dtype=actions.dtype)
+        ast = torch.as_tensor(norm_stats["action_std"], device=actions.device, dtype=actions.dtype)
+        return actions * ast + am
+
+    def _zscore_actions(self, raw_actions, norm_stats):
+        """Re-z-score raw policy output so the evaluator's ``* std + mean``
+        recovers raw meters."""
+        am = torch.as_tensor(
+            norm_stats["action_mean"], device=raw_actions.device, dtype=raw_actions.dtype,
+        )
+        ast = torch.as_tensor(
+            norm_stats["action_std"], device=raw_actions.device, dtype=raw_actions.dtype,
+        )
+        return (raw_actions - am) / ast
+
+    # ------------------------------------------------------------------ #
     # Forward dispatch: training (masked loss) vs inference (action chunk)
     # ------------------------------------------------------------------ #
     def forward(self, batch, norm_stats=None):
@@ -244,15 +305,15 @@ class _ArticubotWrapperBase(nn.Module):
             return self._predict(batch, norm_stats)
 
         obs = self._build_ab_obs(batch, norm_stats)
-        actions = batch["actions"][:, : self.horizon]       # (B, horizon, D_act)
-        is_pad = batch["is_pad"][:, : self.horizon]         # (B, horizon)
-        assert actions.shape[1] == self.horizon, (
+        actions_raw = self._actions_raw(batch, norm_stats)   # (B, horizon, D_act)
+        is_pad = batch["is_pad"][:, : self.horizon]
+        assert actions_raw.shape[1] == self.horizon, (
             "max_seq_length < horizon — re-export dataset or lower --horizon"
         )
 
         policy = self.policy
         nobs = policy.normalizer.normalize(obs)
-        nactions = policy.normalizer["action"].normalize(actions)
+        nactions = policy.normalizer["action"].normalize(actions_raw)   # real z-score
         B = nactions.shape[0]
         device, dtype = nactions.device, nactions.dtype
 
@@ -266,7 +327,9 @@ class _ArticubotWrapperBase(nn.Module):
         velocity_target = nactions - noise
         t_disc = (t * policy.num_timestep_buckets).long()
 
-        pred_velocity = self._predict_velocity(policy, nobs, obs, noisy_actions, t_disc)
+        pred_velocity = self._predict_velocity(
+            policy, nobs, obs, noisy_actions, t_disc, t_cont=t,
+        )
 
         # Masked MSE over non-padded timesteps.
         mask = (~is_pad).to(dtype=dtype).unsqueeze(-1)  # (B, horizon, 1)
@@ -276,14 +339,20 @@ class _ArticubotWrapperBase(nn.Module):
         return {"loss": loss}
 
     def _predict(self, batch, norm_stats):
-        """Obs-only CamPose batch → action tensor (B, n_action_steps, action_dim).
+        """Obs-only CamPose batch → z-scored action tensor (B, n_action_steps, action_dim).
+
+        ``policy.predict_action`` returns actions in raw meters (the policy's
+        real ``unnormalize`` runs at the end of its sampling loop). The
+        CamPose evaluator does ``action * action_std + action_mean`` to
+        un-normalize, so we re-z-score here for an identity round-trip.
 
         Uses ``predict_action`` -> "action" (the n_action_steps-truncated chunk)
         rather than "action_pred" (full horizon) — open-looping the full horizon
         is what flow-matching policies are most fragile to.
         """
         obs = self._build_ab_obs(batch, norm_stats)
-        return self.policy.predict_action(obs)["action"]
+        raw_actions = self.policy.predict_action(obs)["action"]
+        return self._zscore_actions(raw_actions, norm_stats)
 
 
 class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
@@ -339,14 +408,20 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
             obs[f"cam{i}_extrinsic"] = extr[:, i].unsqueeze(1)
             obs[f"cam{i}_intrinsic"] = intr[:, i].unsqueeze(1)
 
-    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc):
+    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
         visual_tokens, state_tokens, visual_pos, state_pos = policy._encode_obs(
             nobs, raw_obs=obs,
         )
         action_features = policy.action_encoder(noisy_actions, t_disc)
 
         gripper_xyz = obs["state"][:, policy.n_obs_steps - 1, :3]
-        action_pos = policy._build_action_pos(gripper_xyz)
+        # Match upstream's compute_loss: build action positions from the
+        # current noisy trajectory estimate. Static positions (no noisy_actions)
+        # diverge from inference, where predict_action *does* refresh positions
+        # from the in-flight trajectory at every denoising step.
+        action_pos = policy._build_action_pos(
+            gripper_xyz, noisy_actions=noisy_actions, t_cont=t_cont,
+        )
         if state_pos is not None:
             hidden_pos = torch.cat([state_pos, action_pos], dim=1)
         else:
@@ -420,7 +495,7 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
         for i in range(n_cams):
             obs[f"cam{i}_plucker"] = plucker[:, i].unsqueeze(1)
 
-    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc):
+    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
         B = noisy_actions.shape[0]
         visual_tokens, state_tokens = policy._encode_obs(nobs, B)
         action_features = policy.action_encoder(noisy_actions, t_disc)

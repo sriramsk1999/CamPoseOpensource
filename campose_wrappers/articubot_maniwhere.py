@@ -113,15 +113,28 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
         if "actions" not in batch:
             return self._predict(batch, norm_stats)
 
+        # ManiWhere's PerspectiveSTN (kornia.warp_perspective) divides by the
+        # bottom-row perspective coefficient. In bf16, when warp_perspective's
+        # backward sees a small denominator, the gradient through 1/z² blows
+        # up to NaN. Run the encoder + DiT + aux losses in fp32 to avoid this
+        # — other policies stay on bf16 via train.py's autocast block.
+        with torch.autocast("cuda", enabled=False):
+            return self._forward_fp32(batch, norm_stats)
+
+    def _forward_fp32(self, batch, norm_stats):
         # ----- Adapt batch to ArticuBot obs dict (move + fixed pair) -----
         obs = self._build_ab_obs(batch, norm_stats)
-        actions = batch["actions"][:, : self.horizon]
+        actions_raw = self._actions_raw(batch, norm_stats).float()
         is_pad = batch["is_pad"][:, : self.horizon]
-        assert actions.shape[1] == self.horizon
+        assert actions_raw.shape[1] == self.horizon
 
         policy = self.policy
+        # Cast all obs entries to fp32 — _build_ab_obs preserves whatever the
+        # dataloader emits (fp32 in our pipeline) but the autocast context
+        # would otherwise downcast on the way in.
+        obs = {k: (v.float() if torch.is_floating_point(v) else v) for k, v in obs.items()}
         nobs = policy.normalizer.normalize(obs)
-        nactions = policy.normalizer["action"].normalize(actions)
+        nactions = policy.normalizer["action"].normalize(actions_raw)
         B = nactions.shape[0]
         device, dtype = nactions.device, nactions.dtype
 
@@ -170,3 +183,10 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
             "aux_l2_final": aux["l2_final"].detach(),
             "aux_l2_layers": aux["l2_layers"].detach(),
         }
+
+    def _predict(self, batch, norm_stats):
+        """Force fp32 at inference as well — STN warp_perspective NaNs the
+        same way during the forward pass under bf16 autocast.
+        """
+        with torch.autocast("cuda", enabled=False):
+            return super()._predict(batch, norm_stats)
