@@ -28,6 +28,9 @@ pip install "git+https://github.com/openai/CLIP.git"
 pip install kornia zarr
 pip install mujoco
 
+pip install torchmetrics omegaconf cached_path datasets decord
+pip install peft
+
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 # only need for robosuite

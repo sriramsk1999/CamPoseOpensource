@@ -486,11 +486,14 @@ class Evaluator:
                 }
 
             state_vector = self.env.sim.data.qpos[:7]
+            gripper_q = float(self.env.sim.data.qpos[7:9].mean())
             if drop_proprio:
                 state_vector = np.zeros_like(state_vector)
+                gripper_q = 0.0
             normalized_state = (state_vector - self.norm_stats["state_mean"].cpu().numpy()) / self.norm_stats["state_std"].cpu().numpy()
             state_tensor = einops.rearrange(torch.tensor(normalized_state, device="cuda").float(), 'd -> 1 d')
             batch['qpos'] = state_tensor
+            batch['gripper_qpos'] = torch.tensor([gripper_q], device="cuda", dtype=torch.float32)
 
             with torch.no_grad(), (torch.autocast("cuda", dtype=torch.bfloat16) if self.args.use_fp16 else nullcontext()):
                 action_chunk = policy(batch)

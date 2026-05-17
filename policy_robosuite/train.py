@@ -27,11 +27,19 @@ from campose_wrappers.articubot_dit import (
 )
 from campose_wrappers.articubot_3dfa import Articubot3DFAWrapper
 from campose_wrappers.articubot_maniwhere import ArticubotManiWhereWrapper
+from campose_wrappers.molmobot import MolmoBotWrapper
 
 import wandb
 
 torch.backends.cuda.enable_flash_sdp(True)
 print(torch.backends.cuda.is_flash_attention_available())
+
+# Per-task language prompt
+TASK_PROMPTS = {
+    "squarerand": "insert the square peg into the square hole",
+    "liftrand":   "pick up the cube and lift it",
+    "canrand":    "pick up the can and place it on the target",
+}
 
 def main(args, ckpt=None):
     set_seed(args.seed)
@@ -116,6 +124,24 @@ def main(args, ckpt=None):
             policy = ArticubotDiTSingleViewWrapper(
                 use_plucker=args.use_plucker, **kwargs,
             ).cuda()
+    elif args.policy_class == 'molmobot':
+        # MolmoBot expects 8-dim joint state (7 arm + 1 gripper) and 8-dim
+        # joint actions (matches the joint_abs dataset). The wrapper installs
+        # LoRA + freezes vision; pretrained backbone stays in bf16 on GPU.
+        assert 'joint' in args.dataset_path, (
+            "molmobot requires a joint-action dataset (e.g. squarerand_joint_abs). "
+            "Run script_robosuite_demos/build_joint_abs_dataset.py first."
+        )
+        task_key = args.dataset_suffix.split('_', 1)[0]
+        args.task_prompt = TASK_PROMPTS[task_key]
+        policy = MolmoBotWrapper(
+            args=args,
+            state_dim=8,
+            action_dim=args.action_dim,
+            num_cams=args.num_side_cam,
+            image_size=224,
+            norm_stats=stats,
+        )
 
     optimizer = policy.configure_optimizers()
 
@@ -280,7 +306,8 @@ if __name__ == '__main__':
     parser.add_argument('--policy_class', type=str, default='act',
                         choices=['dp', 'act', 'smolvla', 'act_dino_sv',
                                  'dit_rope4d_dino_cv', 'dit_dino_sv',
-                                 'flow_matching_3dfa', 'dit_maniwhere_sv'],
+                                 'flow_matching_3dfa', 'dit_maniwhere_sv',
+                                 'molmobot'],
                         help='policy class')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')

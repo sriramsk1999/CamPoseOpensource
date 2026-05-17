@@ -198,6 +198,27 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
     action_min_raw = actions_array.min(axis=0)
     action_max_raw = actions_array.max(axis=0)
 
+    if 'joint' in dataset_path:
+        with h5py.File(dataset_path, 'r') as dataset_file:
+            gripper_states_chunks = []
+            for i in range(num_demos_to_use):
+                states_full = dataset_file[f'data/demo_{i}/states'][()].astype(np.float32)
+                # Panda gripper finger qpos at indices 8-9; mean for a single-dim signal.
+                if states_full.shape[1] >= 10:
+                    gripper_states_chunks.append(states_full[:, 8:10].mean(axis=1, keepdims=True))
+        gripper_states = (
+            np.concatenate(gripper_states_chunks, axis=0)
+            if gripper_states_chunks else np.zeros((1, 1), dtype=np.float32)
+        )
+        # 8-dim state = [arm_qpos (7), gripper_qpos (1)]
+        full_state_array = np.concatenate([states_array, gripper_states], axis=1)
+        state_q01 = np.quantile(full_state_array, 0.01, axis=0)
+        state_q99 = np.quantile(full_state_array, 0.99, axis=0)
+        action_q01 = np.quantile(actions_array, 0.01, axis=0)
+        action_q99 = np.quantile(actions_array, 0.99, axis=0)
+    else:
+        state_q01 = state_q99 = action_q01 = action_q99 = None
+
     stats = {
         "state_mean": state_mean,
         "state_std": state_std,
@@ -205,6 +226,10 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
         "action_std": action_std,
         "action_min": action_min_raw,
         "action_max": action_max_raw,
+        "state_q01": state_q01,
+        "state_q99": state_q99,
+        "action_q01": action_q01,
+        "action_q99": action_q99,
     }
 
     print(f"State Mean shape: {stats['state_mean'].shape}, Action Mean shape: {stats['action_mean'].shape}")
@@ -642,9 +667,11 @@ class EpisodicDataset(Dataset):
 
         # Normalize and convert to tensors
         robot_qpos = states[start_ts][1:8]
+        gripper_qpos = float(states[start_ts][8:10].mean()) if states.shape[1] >= 10 else 0.0
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
             eef_xyz = np.zeros_like(eef_xyz)
+            gripper_qpos = 0.0
         actions_seq = actions[start_ts:]
 
         padded_actions = np.zeros((self.max_seq_length, actions.shape[1]), dtype=np.float32)
@@ -665,6 +692,7 @@ class EpisodicDataset(Dataset):
             'cam_extrinsics': cam_extrinsics,
             # New fields (always emitted; existing policies ignore them)
             'eef_xyz': torch.from_numpy(eef_xyz).float().cuda(),
+            'gripper_qpos': torch.tensor(gripper_qpos, dtype=torch.float32, device='cuda'),
             'cam_extrinsics_full': cam_extrinsics_stack,  # (num_cams, 4, 4) c2w
             'cam_intrinsics_full': cam_intrinsics_stack,  # (num_cams, 3, 3)
         }
