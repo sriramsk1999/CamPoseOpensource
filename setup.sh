@@ -29,7 +29,7 @@ pip install kornia zarr
 pip install mujoco
 
 pip install torchmetrics omegaconf cached_path datasets decord
-pip install peft
+pip install peft addict
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
