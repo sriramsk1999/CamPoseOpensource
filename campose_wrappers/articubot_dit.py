@@ -22,6 +22,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _c2w_gl_to_w2c_cv(c2w_gl: torch.Tensor) -> torch.Tensor:
+    """Convert a batched (..., 4, 4) c2w in OpenGL/mujoco convention to
+    w2c in OpenCV convention. OpenGL → OpenCV flips the Y and Z camera
+    axes (right-multiply by diag(1, -1, -1, 1)); c2w → w2c inverts.
+    """
+    flip = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0],
+         [0.0, -1.0, 0.0, 0.0],
+         [0.0, 0.0, -1.0, 0.0],
+         [0.0, 0.0, 0.0, 1.0]],
+        device=c2w_gl.device, dtype=c2w_gl.dtype,
+    )
+    c2w_cv = c2w_gl @ flip
+    R = c2w_cv[..., :3, :3]
+    t = c2w_cv[..., :3, 3]
+    R_inv = R.transpose(-1, -2)
+    t_inv = -(R_inv @ t.unsqueeze(-1)).squeeze(-1)
+    w2c = torch.zeros_like(c2w_cv)
+    w2c[..., :3, :3] = R_inv
+    w2c[..., :3, 3] = t_inv
+    w2c[..., 3, 3] = 1.0
+    return w2c
+
+
 def _ensure_articubot_on_path():
     path = os.environ.get("ARTICUBOT_DP") or os.path.expanduser(
         "~/Desktop/ArticuBot/diffusion_policy"
@@ -401,11 +425,16 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
 
     def _add_geometry_obs(self, obs, batch, n_cams):
         pm = batch["pointmap"]                    # (B, n_cams, 3, H, W)
-        extr = batch["cam_extrinsics_full"]       # (B, n_cams, 4, 4)
+        extr = batch["cam_extrinsics_full"]       # (B, n_cams, 4, 4) c2w-GL
         intr = batch["cam_intrinsics_full"]       # (B, n_cams, 3, 3)
+        # Upstream CameraEnc + DA3 weights expect w2c in OpenCV convention
+        # (dino_cross_view_encoder.py:697,721). The dataloader stores c2w in
+        # mujoco/GL convention; convert here so DA3-pretrained pose tokens see
+        # the geometry they were trained on.
+        extr_w2c_cv = _c2w_gl_to_w2c_cv(extr)
         for i in range(n_cams):
             obs[f"cam{i}_pointmap"] = pm[:, i].unsqueeze(1)
-            obs[f"cam{i}_extrinsic"] = extr[:, i].unsqueeze(1)
+            obs[f"cam{i}_extrinsic"] = extr_w2c_cv[:, i].unsqueeze(1)
             obs[f"cam{i}_intrinsic"] = intr[:, i].unsqueeze(1)
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):

@@ -9,11 +9,48 @@ ArticuBot obs adapter.
 
 Configured for CamPose's 7-dim ``eef_delta`` action via
 ``rotation_format='euler'`` (3 xyz + 3 euler + 1 grip = 7).
+
+Loss override: L1 + 30/10/1 coefs  →  normalized MSE
+----------------------------------------------------
+Three layers of disagreement on the loss for 3DFA:
+
+* The paper (arXiv:2508.11002) describes L2 on velocity (pos + rot) +
+  BCE-with-logits on gripper.
+* The original 3DFA repo
+  (``3d_flowmatch_actor/modeling/policy/base_denoise_actor.py:235-239``)
+  uses ``30 * L1(pos) + 10 * L1(rot) + BCE(gripper)`` — keeps BCE on
+  gripper but uses L1 for pos/rot with hardcoded coefficients inherited
+  from 3D Diffuser Actor / PerAct.
+* The ArticuBot vendored copy at
+  ``ArticuBot/.../flowmatch_3dfa/policy/base_denoise_actor.py:230-234``
+  silently changed BCE → L1 during the port, leaving every term as L1.
+
+Empirically the vendored loss collapses 3DFA on Square: xyz/rot
+under-predicted by ~5×, persistent +0.03 rot drift, success at 0%
+(diagnose_3dfa_realobs.py against a 20k-step ckpt).
+
+We swap to a single MSE over the full ``[pos_velocity, rot_velocity,
+openess]`` vector in normalized space, equal per-dim weighting — same
+loss shape the DiT/RoPE4D wrappers in this same codebase use, and they
+train successfully on the same dataset. Gripper stays as a regression
+target (not BCE) because (a) it kept the patch minimum-change, (b) on
+real obs the model already predicts the right gripper values for the
+phases it's seen (only the synthetic-noise "no context" prior collapsed
+in diagnose_3dfa.py), and (c) BCE would require extra inference-time
+sigmoid + scale plumbing that compute_trajectory in the vendored copy
+doesn't have. Set ``_USE_MSE_LOSS = False`` to revert.
 """
+import types
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from campose_wrappers.articubot_dit import _ArticubotWrapperBase
+
+
+# Flip to False to restore upstream's L1 + 30/10/1 coef loss.
+_USE_MSE_LOSS = True
 
 
 # Mirror ArticuBot/diffusion_policy/config/train_flow_matching_3dfa_workspace.yaml
@@ -106,6 +143,78 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
             policy.model.workspace_normalizer.copy_(
                 torch.stack([action_min, action_max])
             )
+
+        if _USE_MSE_LOSS:
+            self._install_mse_loss()
+
+    def _install_mse_loss(self):
+        """Monkey-patch ``self.policy.model.compute_loss`` to use one MSE
+        over the full ``[pos_velocity, rot_velocity, openess]`` prediction
+        vector in normalized space — paper-aligned, DiT-wrapper-aligned.
+
+        Verbatim copy of upstream's compute_loss flow (encode → noise
+        schedule → policy_forward_pass → per-layer accumulation) except the
+        per-layer loss is now a single MSE over the 7-dim target.
+
+        Target construction (still normalized space, same as upstream):
+          target[..., :3] = noise[..., :3] - gt_pos    (pos velocity)
+          target[..., 3:6] = noise[..., 3:] - gt_rot   (rot velocity)
+          target[..., 6:7] = gt_openess                (gripper raw value;
+                              not noised — matches paper which uses BCE here,
+                              swap to BCE later if this still under-drives gripper)
+
+        Why monkey-patch rather than subclass: ``DenoiseActor3D`` is built
+        deep inside ``FlowMatching3DFAImagePolicy.__init__`` so subclassing
+        means duplicating that whole construction. The patch is local,
+        reversible (``_USE_MSE_LOSS = False``), and survives state_dict
+        load/save (we're only swapping a bound method, not a parameter).
+        """
+        model = self.policy.model
+
+        def compute_loss_mse(self_model, gt_trajectory, rgb3d, rgb2d, pcd, proprio):
+            fixed_inputs = self_model.encode_inputs(rgb3d, rgb2d, pcd, proprio)
+
+            gt_openess = gt_trajectory[..., -1:]
+            gt_trajectory = gt_trajectory[..., :-1]
+            gt_trajectory = self_model.normalize_pos(gt_trajectory)
+            _, traj_len, nhand, _ = gt_trajectory.shape
+            gt_trajectory = self_model.convert_rot(
+                gt_trajectory.flatten(1, 2)
+            ).unflatten(1, (traj_len, nhand))
+
+            total_loss = 0
+            for _ in range(self_model._lv2_batch_size):
+                noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
+                timesteps = self_model.position_scheduler.sample_noise_step(
+                    num_noise=len(noise), device=noise.device,
+                )
+                pos = self_model.position_scheduler.add_noise(
+                    gt_trajectory[..., :3], noise[..., :3], timesteps,
+                )
+                rot = self_model.rotation_scheduler.add_noise(
+                    gt_trajectory[..., 3:], noise[..., 3:], timesteps,
+                )
+                noisy_trajectory = torch.cat((pos, rot), -1)
+                pred = self_model.policy_forward_pass(
+                    noisy_trajectory, timesteps, fixed_inputs,
+                )
+                denoise_target = self_model.position_scheduler.prepare_target(
+                    noise, gt_trajectory,
+                )  # (B, T, 1, 6) = velocity targets for [pos, rot]
+                # Concat with gripper raw value to form a single (B, T, 1, 7)
+                # target matching layer_pred's [pos_v, rot_v, openess] layout.
+                full_target = torch.cat([denoise_target, gt_openess], dim=-1)
+                for layer_pred in pred:
+                    # F.mse_loss with reduction='mean' averages over all
+                    # (B, T, 1, 7) elements — every dim contributes equally,
+                    # mirrors the DiT wrapper's `sq.sum() / (mask.sum() *
+                    # action_dim)` normalization (no padding mask yet;
+                    # padding is ~3% of action entries on Square).
+                    loss = F.mse_loss(layer_pred, full_target, reduction="mean")
+                    total_loss = total_loss + loss
+            return total_loss / self_model._lv2_batch_size
+
+        model.compute_loss = types.MethodType(compute_loss_mse, model)
 
     # 3DFA's CLIP encoder expects RGB in [0, 1]; override the base wrapper's
     # [-1, 1] conversion to skip that step. Pointmap is added separately.

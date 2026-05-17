@@ -10,6 +10,20 @@ are computed across the (move, fixed) view pair the dataloader emits.
 Why DiT not ACT: pick is symmetric with ``dit_dino_sv`` / ``dit_dino_sv``
 canonical baseline so the action head is fixed and the only varying piece
 is the visual representation.
+
+STN stabilization
+-----------------
+Upstream ManiWhere is RL — its ``aux_latency=150000`` (camera_aug_config.yaml:62)
+freezes the STNs for the first 150k env steps so the base encoder converges
+before any aux-driven STN updates. We saw classic NaN-divergence around BC
+step ~2k with the unconstrained STN active from step 0. To port the same
+contract to BC scale:
+  - ``stn_warmup_steps``: STN params frozen for the first N optimizer steps.
+  - Weight regularizer (``stn_reg_weight``) on the STN's final FC weights —
+    keeps the predicted homography close to identity (init: weight=0,
+    bias=eye, so output theta=I exactly when weight=0).
+  - Theta stats logged each step so drift is visible in wandb (max |theta|
+    and the perspective-row norm ``||theta[2, :2]||``).
 """
 import torch
 import torch.nn as nn
@@ -28,6 +42,14 @@ _MANIWHERE_AUX_COEF = 1.0
 _MANIWHERE_L2_COEF = 1.0
 _MANIWHERE_TEMP = 0.1
 
+# STN stabilization knobs. _WARMUP_STEPS at 2000 mirrors the "stabilize base
+# encoder first" intent of upstream's aux_latency, scaled from 150k RL steps
+# to a typical BC training horizon. _REG_WEIGHT is small — the regularizer's
+# only job is to pull the predicted homography back toward identity after
+# unfreezing, not to dominate the BC loss.
+_STN_WARMUP_STEPS = 2000
+_STN_REG_WEIGHT = 1e-2
+
 _MANIWHERE_ENCODER_CFG = {
     "pretrained": True,
     "aux_feature_dim": 256,
@@ -37,6 +59,81 @@ _MANIWHERE_ENCODER_CFG = {
 
 class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
     """dit_maniwhere_sv: vanilla DiT + ManiWhere ResNet18+STN encoder + aux losses."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # STN stabilization plumbing (see module docstring). Defaults from the
+        # module-level constants; safe to mutate after construction.
+        self._stn_warmup_steps = _STN_WARMUP_STEPS
+        self._stn_reg_weight = _STN_REG_WEIGHT
+        self._train_step = 0
+        self._theta_capture: dict[str, torch.Tensor] = {}
+        self._stn_unfrozen = False
+
+        self._freeze_stns()
+        self._register_theta_hooks()
+
+    # ------------------------------------------------------------------ #
+    # STN stabilization helpers                                           #
+    # ------------------------------------------------------------------ #
+
+    def _stn_modules(self):
+        """Yield the two STN modules under the maniwhere encoder."""
+        enc = self.policy.visual_encoder.encoder
+        return enc.input_stn, enc.conv1_stn
+
+    def _freeze_stns(self):
+        for stn in self._stn_modules():
+            for p in stn.parameters():
+                p.requires_grad = False
+
+    def _unfreeze_stns(self):
+        for stn in self._stn_modules():
+            for p in stn.parameters():
+                p.requires_grad = True
+        self._stn_unfrozen = True
+
+    def _stn_weight_reg(self) -> torch.Tensor:
+        """L2 on the STN final-FC weights. Init is weight=0 + bias=eye, so
+        small weights ↔ theta ≈ identity ↔ warp_perspective stays well-posed.
+        """
+        reg = 0.0
+        for stn in self._stn_modules():
+            reg = reg + stn.fc_loc[2].weight.pow(2).sum()
+        return reg
+
+    def _register_theta_hooks(self):
+        """Capture each STN's predicted theta (3x3) via a forward hook on its
+        final FC. Read after each forward pass for logging.
+        """
+        enc = self.policy.visual_encoder.encoder
+
+        def make_hook(name):
+            def hook(module, inp, out):
+                # out: (B*, 9) → (B*, 3, 3)
+                self._theta_capture[name] = out.detach().reshape(-1, 3, 3)
+            return hook
+
+        enc.input_stn.fc_loc[2].register_forward_hook(make_hook("input_stn"))
+        enc.conv1_stn.fc_loc[2].register_forward_hook(make_hook("conv1_stn"))
+
+    def _theta_stats(self) -> dict:
+        """Summarize captured thetas for wandb. Bottom-row norm is the key
+        warp_perspective stability signal: small ||theta[2, :2]|| keeps the
+        perspective denominator near 1 across the image.
+        """
+        stats = {}
+        for name, theta in self._theta_capture.items():
+            stats[f"theta_{name}_max_abs"] = theta.abs().max()
+            # Bottom row [theta[2,0], theta[2,1], theta[2,2]] — first two
+            # control perspective skew; third is the homography scale.
+            stats[f"theta_{name}_perspective_norm"] = (
+                theta[..., 2, :2].pow(2).sum(-1).sqrt().mean()
+            )
+            stats[f"theta_{name}_diag_dev"] = (
+                (theta[..., 2, 2] - 1.0).abs().mean()
+            )
+        return stats
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
         # ManiWhere takes RGB-D (3+1) per cam. Both move (cam{i}_image) and
@@ -175,14 +272,36 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
             + _MANIWHERE_L2_COEF * (aux["l2_final"] + aux["l2_layers"])
         )
 
-        loss = fm_loss + aux_loss
-        return {
+        # ----- STN warmup gate (RL curriculum ported to BC scale) -----
+        # Upstream maniwhere freezes the STN for ~150k env steps via
+        # aux_latency. We freeze at construction (see __init__) and unfreeze
+        # at the first training step past _stn_warmup_steps so the base
+        # encoder + DiT settle before the STN starts learning.
+        if self.training:
+            self._train_step += 1
+            if (
+                not self._stn_unfrozen
+                and self._train_step >= self._stn_warmup_steps
+            ):
+                self._unfreeze_stns()
+
+        # STN weight regularizer — pulls predicted theta toward identity
+        # even after unfreezing, so warp_perspective's 1/z² backward stays
+        # well-conditioned. Cheap (two scalar L2 norms).
+        stn_reg = self._stn_weight_reg()
+
+        loss = fm_loss + aux_loss + self._stn_reg_weight * stn_reg
+        out = {
             "loss": loss,
             "fm_loss": fm_loss.detach(),
             "aux_contrastive": aux["contrastive"].detach(),
             "aux_l2_final": aux["l2_final"].detach(),
             "aux_l2_layers": aux["l2_layers"].detach(),
+            "stn_reg": stn_reg.detach() if torch.is_tensor(stn_reg) else torch.zeros((), device=device),
+            "stn_unfrozen": torch.tensor(float(self._stn_unfrozen), device=device),
         }
+        out.update(self._theta_stats())
+        return out
 
     def _predict(self, batch, norm_stats):
         """Force fp32 at inference as well — STN warp_perspective NaNs the
