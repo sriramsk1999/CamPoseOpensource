@@ -198,14 +198,24 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
     action_min_raw = actions_array.min(axis=0)
     action_max_raw = actions_array.max(axis=0)
 
+    # action_q01/q99 are robust bounds consumed by Articubot3DFAWrapper to
+    # populate workspace_normalizer. Computed unconditionally so eef_delta
+    # datasets get them too — raw action_min/max are dominated by 0.1%
+    # axis-angle wraparound outliers (rot delta up to ±2π), which crushes
+    # typical rot deltas (~0.01 rad) to ~0.001 in workspace_normalizer's
+    # [-1,1] frame and kills the rotation flow-matching signal.
+    action_q01 = np.quantile(actions_array, 0.01, axis=0)
+    action_q99 = np.quantile(actions_array, 0.99, axis=0)
     if 'joint' in dataset_path:
         with h5py.File(dataset_path, 'r') as dataset_file:
             gripper_states_chunks = []
             for i in range(num_demos_to_use):
                 states_full = dataset_file[f'data/demo_{i}/states'][()].astype(np.float32)
-                # Panda gripper finger qpos at indices 8-9; mean for a single-dim signal.
                 if states_full.shape[1] >= 10:
-                    gripper_states_chunks.append(states_full[:, 8:10].mean(axis=1, keepdims=True))
+                    width = (
+                        states_full[:, 8:9] - states_full[:, 9:10]
+                    )  # (T, 1)
+                    gripper_states_chunks.append(width)
         gripper_states = (
             np.concatenate(gripper_states_chunks, axis=0)
             if gripper_states_chunks else np.zeros((1, 1), dtype=np.float32)
@@ -214,10 +224,8 @@ def get_norm_stats(dataset_path, num_demos, policy_class: str = 'dp'):
         full_state_array = np.concatenate([states_array, gripper_states], axis=1)
         state_q01 = np.quantile(full_state_array, 0.01, axis=0)
         state_q99 = np.quantile(full_state_array, 0.99, axis=0)
-        action_q01 = np.quantile(actions_array, 0.01, axis=0)
-        action_q99 = np.quantile(actions_array, 0.99, axis=0)
     else:
-        state_q01 = state_q99 = action_q01 = action_q99 = None
+        state_q01 = state_q99 = None
 
     stats = {
         "state_mean": state_mean,
@@ -667,7 +675,10 @@ class EpisodicDataset(Dataset):
 
         # Normalize and convert to tensors
         robot_qpos = states[start_ts][1:8]
-        gripper_qpos = float(states[start_ts][8:10].mean()) if states.shape[1] >= 10 else 0.0
+        gripper_qpos = (
+            float(states[start_ts][8] - states[start_ts][9])
+            if states.shape[1] >= 10 else 0.0
+        )
         if np.random.rand() < self.args.prob_drop_proprio:
             robot_qpos = np.zeros_like(robot_qpos)
             eef_xyz = np.zeros_like(eef_xyz)

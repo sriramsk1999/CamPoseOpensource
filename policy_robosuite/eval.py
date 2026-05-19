@@ -486,7 +486,7 @@ class Evaluator:
                 }
 
             state_vector = self.env.sim.data.qpos[:7]
-            gripper_q = float(self.env.sim.data.qpos[7:9].mean())
+            gripper_q = float(self.env.sim.data.qpos[7] - self.env.sim.data.qpos[8])
             if drop_proprio:
                 state_vector = np.zeros_like(state_vector)
                 gripper_q = 0.0

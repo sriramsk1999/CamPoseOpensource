@@ -83,8 +83,8 @@ def main(args, ckpt=None):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     stats_path = os.path.join(args.ckpt_dir, 'dataset_stats.json')
     with open(stats_path, 'w') as f:
-        # state_q01/q99 and action_q01/q99 are None for non-joint datasets
-        # (get_norm_stats only fills them when 'joint' is in dataset_path).
+        # state_q01/q99 are None for non-joint datasets (get_norm_stats fills
+        # state_q01/q99 only when 'joint' is in dataset_path;
         json.dump(
             {k: v.tolist() for k, v in stats.items() if v is not None},
             f, indent=4,

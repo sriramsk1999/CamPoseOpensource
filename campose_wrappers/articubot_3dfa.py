@@ -109,14 +109,28 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         )
 
     def _post_normalizer_setup(self):
-        """Populate ``DenoiseActor3D.workspace_normalizer`` with raw action
-        min/max. Upstream wires this via ``set_normalizer``; we install the
+        """Populate ``DenoiseActor3D.workspace_normalizer`` with action
+        bounds. Upstream wires this via ``set_normalizer``; we install the
         policy normalizer directly (see ``_ArticubotWrapperBase.__init__``),
         so the buffer would otherwise stay at its default
         ``[[0,0,0,0,0,0],[1,1,1,1,1,1]]`` — which collapses meter-scale gt
         deltas to ~-1 in ``normalize_pos`` and breaks the RoPE3D query
         positions (``unnormalize_pos(noisy) + cumsum`` would live in
         arbitrary units rather than the pointmap's world frame).
+
+        q01/q99 over action_min/action_max: raw deltas contain ~0.1%
+        axis-angle wraparound outliers (rotation deltas up to ±2π from
+        ``gen_robosuite_format_demo.py``'s naive ``abs_pose - prev_abs_pose``
+        subtraction). Those few outliers inflate raw min/max by 100–150× in
+        rotation dims (e.g. d4: typical q01/q99 span 0.09 rad vs raw min/max
+        span 12.5 rad). With raw min/max in workspace_normalizer, a typical
+        0.01-rad rot delta normalizes to ~0.0016 in [-1, 1] — the rotation
+        signal is crushed against ``N(0,1)`` flow-matching noise and the
+        model degenerates to predicting input noise (loss drops, rot
+        unlearnable). q01/q99 puts the same 0.01 rad at ~0.48 — comparable
+        to position SNR. Outlier wraparound events normalize >|1| but only
+        0.1% of training points hit those (and they aren't proper SO(3)
+        deltas to begin with).
 
         Note: upstream's ``set_normalizer`` only copies ``[:3]`` (xyz) into
         the workspace buffer, but for euler the buffer is 6-wide (xyz + 3
@@ -126,11 +140,11 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         policy = self.policy
         nrm_dim = int(policy.model.workspace_normalizer.size(-1))
         action_min = torch.as_tensor(
-            norm_stats["action_min"], dtype=torch.float32,
-        ).reshape(-1)[:nrm_dim]
+            norm_stats["action_q01"], dtype=torch.float32,
+        ).reshape(-1)[:nrm_dim].clone()
         action_max = torch.as_tensor(
-            norm_stats["action_max"], dtype=torch.float32,
-        ).reshape(-1)[:nrm_dim]
+            norm_stats["action_q99"], dtype=torch.float32,
+        ).reshape(-1)[:nrm_dim].clone()
         # Guard against degenerate ranges (zero spread) — replace with ±1
         # fallback to keep normalize_pos finite.
         eps = 1e-3
