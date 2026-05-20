@@ -188,7 +188,9 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         """
         model = self.policy.model
 
-        def compute_loss_mse(self_model, gt_trajectory, rgb3d, rgb2d, pcd, proprio):
+        def compute_loss_mse(
+            self_model, gt_trajectory, rgb3d, rgb2d, pcd, proprio, is_pad=None,
+        ):
             fixed_inputs = self_model.encode_inputs(rgb3d, rgb2d, pcd, proprio)
 
             gt_openess = gt_trajectory[..., -1:]
@@ -198,6 +200,18 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
             gt_trajectory = self_model.convert_rot(
                 gt_trajectory.flatten(1, 2)
             ).unflatten(1, (traj_len, nhand))
+
+            # (B, T, 1, 1) mask: 1 at real timesteps, 0 at padded ones. Padded
+            # actions are zeros from the dataloader; without masking, the
+            # model is explicitly trained to predict zero delta + zero
+            # gripper at end-of-demo timesteps. Mirrors RoPE4D wrapper.
+            if is_pad is not None:
+                mask = (~is_pad).to(gt_trajectory.dtype)[:, :, None, None]
+            else:
+                mask = torch.ones(
+                    gt_trajectory.shape[0], traj_len, 1, 1,
+                    device=gt_trajectory.device, dtype=gt_trajectory.dtype,
+                )
 
             total_loss = 0
             for _ in range(self_model._lv2_batch_size):
@@ -222,13 +236,9 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
                 # target matching layer_pred's [pos_v, rot_v, openess] layout.
                 full_target = torch.cat([denoise_target, gt_openess], dim=-1)
                 for layer_pred in pred:
-                    # F.mse_loss with reduction='mean' averages over all
-                    # (B, T, 1, 7) elements — every dim contributes equally,
-                    # mirrors the DiT wrapper's `sq.sum() / (mask.sum() *
-                    # action_dim)` normalization (no padding mask yet;
-                    # padding is ~3% of action entries on Square).
-                    loss = F.mse_loss(layer_pred, full_target, reduction="mean")
-                    total_loss = total_loss + loss
+                    sq = (layer_pred - full_target) ** 2 * mask
+                    denom = mask.sum().clamp_min(1.0) * layer_pred.shape[-1]
+                    total_loss = total_loss + sq.sum() / denom
             return total_loss / self_model._lv2_batch_size
 
         model.compute_loss = types.MethodType(compute_loss_mse, model)
@@ -272,12 +282,18 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
 
         obs = self._build_ab_obs(batch, norm_stats)
         actions_raw = self._actions_raw(batch, norm_stats)
+        is_pad = batch["is_pad"][:, : self.horizon]   # (B, T) bool
         assert actions_raw.shape[1] == self.horizon, (
             "max_seq_length < horizon — re-export dataset or lower --horizon"
         )
 
-        # 3DFA bypasses ``policy.normalizer`` for actions — its
-        # ``compute_loss`` feeds raw deltas straight to the model, which
-        # runs ``normalize_pos`` against ``workspace_normalizer`` instead.
-        loss = self.policy.compute_loss({"obs": obs, "action": actions_raw})
+        # Bypass FlowMatching3DFAImagePolicy.compute_loss so we can pass
+        # is_pad through to the model's monkey-patched compute_loss_mse
+        # (the upstream policy.compute_loss doesn't know about masking).
+        # Mirrors what policy.compute_loss does otherwise.
+        rgb3d, rgb2d, pcd, proprio = self.policy._build_3dfa_inputs(obs)
+        gt_trajectory = actions_raw.unsqueeze(2).contiguous()   # (B, T, 1, 7)
+        loss = self.policy.model.compute_loss(
+            gt_trajectory, rgb3d, rgb2d, pcd, proprio, is_pad=is_pad,
+        )
         return {"loss": loss}

@@ -156,10 +156,14 @@ def main(args, ckpt=None):
 
     optimizer = policy.configure_optimizers()
 
-    # Flow-matching DiT policies use EMA.
+    # Flow-matching DiT policies use EMA. flow_matching_3dfa is intentionally
+    # excluded — ArticuBot's own train_flow_matching_3dfa_workspace.yaml sets
+    # use_ema: False for this exact policy class (the small 120-d model
+    # appears to be sensitive to weight averaging, and we have no measurement
+    # of 3DFA-with-EMA vs 3DFA-without-EMA on Square).
     use_ema = args.policy_class in (
         'dit_rope4d_dino_cv', 'dit_dino_sv', 'dit_dino_cv',
-        'flow_matching_3dfa', 'dit_maniwhere_sv',
+        'dit_maniwhere_sv',
     )
     ema = None
     eval_policy = policy
