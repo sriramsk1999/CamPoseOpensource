@@ -109,28 +109,29 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         )
 
     def _post_normalizer_setup(self):
-        """Populate ``DenoiseActor3D.workspace_normalizer`` with action
-        bounds. Upstream wires this via ``set_normalizer``; we install the
-        policy normalizer directly (see ``_ArticubotWrapperBase.__init__``),
-        so the buffer would otherwise stay at its default
-        ``[[0,0,0,0,0,0],[1,1,1,1,1,1]]`` — which collapses meter-scale gt
-        deltas to ~-1 in ``normalize_pos`` and breaks the RoPE3D query
-        positions (``unnormalize_pos(noisy) + cumsum`` would live in
-        arbitrary units rather than the pointmap's world frame).
+        """Populate ``DenoiseActor3D.workspace_normalizer`` so the model's
+        internal ``normalize_pos``/``unnormalize_pos`` perform a **z-score**
+        normalization, matching the LinearNormalizer-z-score path used by
+        the RoPE4D / DiT-SV wrappers in this codebase.
 
-        q01/q99 over action_min/action_max: raw deltas contain ~0.1%
-        axis-angle wraparound outliers (rotation deltas up to ±2π from
-        ``gen_robosuite_format_demo.py``'s naive ``abs_pose - prev_abs_pose``
-        subtraction). Those few outliers inflate raw min/max by 100–150× in
-        rotation dims (e.g. d4: typical q01/q99 span 0.09 rad vs raw min/max
-        span 12.5 rad). With raw min/max in workspace_normalizer, a typical
-        0.01-rad rot delta normalizes to ~0.0016 in [-1, 1] — the rotation
-        signal is crushed against ``N(0,1)`` flow-matching noise and the
-        model degenerates to predicting input noise (loss drops, rot
-        unlearnable). q01/q99 puts the same 0.01 rad at ~0.48 — comparable
-        to position SNR. Outlier wraparound events normalize >|1| but only
-        0.1% of training points hit those (and they aren't proper SO(3)
-        deltas to begin with).
+        Trick: ``normalize_pos(x) = 2*(x - _min)/(_max - _min) - 1``.
+        With ``_min = mean - std`` and ``_max = mean + std`` the denominator
+        is ``2*std`` and:
+
+            normalize_pos(x)   = (x - mean) / std        # z-score
+            unnormalize_pos(z) = z*std + mean            # un-z-score
+
+        That matches the RoPE4D wrapper's normalizer and keeps every other
+        line of the 3DFA model code (cumsum, RoPE3D positions, sampler
+        ``add_noise``, etc.) untouched. Bound outliers at ~30σ rather than
+        the ~130 we got with q01/q99 — same scale the RoPE4D wrapper sees.
+
+        Reasons we don't use the policy's ``LinearNormalizer`` directly:
+        the 3DFA model carries its OWN normalize_pos call chain (inside
+        ``encode_inputs`` and ``compute_trajectory``) — to avoid double
+        normalization we would have to either rewrite the model or set the
+        workspace buffer such that the model's internal normalize is the
+        no-op. The latter is what this function does.
 
         Note: upstream's ``set_normalizer`` only copies ``[:3]`` (xyz) into
         the workspace buffer, but for euler the buffer is 6-wide (xyz + 3
@@ -139,12 +140,14 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         norm_stats = self._norm_stats
         policy = self.policy
         nrm_dim = int(policy.model.workspace_normalizer.size(-1))
-        action_min = torch.as_tensor(
-            norm_stats["action_q01"], dtype=torch.float32,
+        action_mean = torch.as_tensor(
+            norm_stats["action_mean"], dtype=torch.float32,
         ).reshape(-1)[:nrm_dim].clone()
-        action_max = torch.as_tensor(
-            norm_stats["action_q99"], dtype=torch.float32,
-        ).reshape(-1)[:nrm_dim].clone()
+        action_std = torch.as_tensor(
+            norm_stats["action_std"], dtype=torch.float32,
+        ).reshape(-1)[:nrm_dim].clone().clamp_min(1e-6)
+        action_min = action_mean - action_std
+        action_max = action_mean + action_std
         # Guard against degenerate ranges (zero spread) — replace with ±1
         # fallback to keep normalize_pos finite.
         eps = 1e-3
