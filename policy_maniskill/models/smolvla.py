@@ -17,9 +17,16 @@ from transformers import (
 )
 
 
-# Force HF caches to the project directory and offline-only behavior
-_HF_CACHE = "/share/data/ripl/tianchong/projects/CamPoseRobosuite/hf_weights"
-os.makedirs(_HF_CACHE, exist_ok=True)
+# Force HF caches to the project directory and offline-only behavior.
+# Repo-relative so it works on any cluster (mirrors policy_robosuite/models/smolvla.py).
+_HF_CACHE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'hf_weights'))
+try:
+    os.makedirs(_HF_CACHE, exist_ok=True)
+except PermissionError:
+    # Import-time guard: don't crash the whole train.py just because the
+    # SmolVLA cache dir isn't writable. SmolVLA-using code paths will fail
+    # later when they actually need the cache; other policies don't.
+    pass
 os.environ["HF_HOME"] = _HF_CACHE
 os.environ["HF_HUB_CACHE"] = _HF_CACHE
 os.environ["TRANSFORMERS_CACHE"] = _HF_CACHE
