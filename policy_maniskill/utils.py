@@ -184,11 +184,24 @@ def get_norm_stats(dataset_path, num_demos, policy_class):
         action_std = np.std(actions_array, axis=0)
         action_std = np.clip(action_std, 1e-4, np.inf)
 
+    # Raw action min/max + q01/q99 — consumed by Articubot* wrappers via
+    # _build_normalizer (LinearNormalizer.input_stats) and (historically) by
+    # 3DFA's workspace_normalizer. Stored for all policy classes so the
+    # wrapper code paths don't have to special-case maniskill.
+    action_min_raw = actions_array.min(axis=0)
+    action_max_raw = actions_array.max(axis=0)
+    action_q01 = np.quantile(actions_array, 0.01, axis=0)
+    action_q99 = np.quantile(actions_array, 0.99, axis=0)
+
     stats = {
         "state_mean": state_mean,
         "state_std": state_std,
         "action_mean": action_mean,
-        "action_std": action_std
+        "action_std": action_std,
+        "action_min": action_min_raw,
+        "action_max": action_max_raw,
+        "action_q01": action_q01,
+        "action_q99": action_q99,
     }
     print(f"State Mean shape: {stats['state_mean'].shape}, Action Mean shape: {stats['action_mean'].shape}")
     return stats
