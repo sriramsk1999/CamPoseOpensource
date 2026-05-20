@@ -21,6 +21,20 @@ from eval import to_mp4
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 sys.path.insert(0, _REPO_ROOT)
 from policy_common.paired_crop import PairedRandomCrop, adjust_intrinsic
+from policy_common.canonical_view import fuse_and_render_from_world_points
+from policy_common.pointmap import c2w_opengl_to_opencv, invert_pose
+
+
+def _to_numpy(x):
+    """np.asarray-equivalent that handles CUDA torch tensors.
+
+    `camera.get_params()` on a sim_backend='gpu' env returns CUDA tensors;
+    plain np.asarray() on them raises ("can't convert cuda tensor"). This
+    helper covers both CPU/GPU tensors and numpy arrays.
+    """
+    if hasattr(x, 'detach'):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 # --- Utility Functions ---
 
@@ -249,11 +263,43 @@ class EpisodicDataset(Dataset):
         self.args = args
         self.image_size = 256
         self.use_plucker = args.use_plucker
+        # Pointmap rendering + 224-paired crop pipeline. flow_matching_3dfa
+        # consumes pointmaps via _add_geometry_obs; dit_dino_cv does NOT
+        # (cross-view DINO works on RGB only).
         self.is_articubot = args.policy_class in (
-            'dit_rope4d_dino_cv', 'dit_dino_sv',
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'dit_dino_cv',
+            'flow_matching_3dfa',
         )
+        self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         self._paired_crop = PairedRandomCrop(src=self.image_size, dst=224)
         self.env = env
+
+        # Canonical-view setup: the first num_side_cam cameras
+        # (cam_0..cam_{num_side_cam-1}) define fixed target viewpoints that
+        # every episode is re-rendered into. Deterministic per --seed
+        # because _default_human_render_camera_configs uses np.random at
+        # env construction time and set_seed runs before gym.make.
+        self.canonical_c2ws_gl = None
+        self.canonical_w2cs_cv = None
+        self.canonical_Ks = None
+        if self.use_canonical_views:
+            self.canonical_c2ws_gl = []
+            self.canonical_w2cs_cv = []
+            self.canonical_Ks = []
+            for i in range(self.args.num_side_cam):
+                cam = self.env.unwrapped.scene.human_render_cameras[f'cam_{i}']
+                params = cam.get_params()
+                K = _to_numpy(params["intrinsic_cv"]).astype(np.float32)
+                if K.ndim == 3:
+                    K = K[0]
+                c2w_gl = _to_numpy(params["cam2world_gl"]).astype(np.float32)
+                if c2w_gl.ndim == 3:
+                    c2w_gl = c2w_gl[0]
+                self.canonical_c2ws_gl.append(c2w_gl)
+                self.canonical_Ks.append(K)
+                self.canonical_w2cs_cv.append(
+                    invert_pose(c2w_opengl_to_opencv(c2w_gl))
+                )
 
         if self.use_plucker:
             self.plucker_embedder = PluckerEmbedder(img_size=self.image_size, device='cuda')
@@ -367,14 +413,74 @@ class EpisodicDataset(Dataset):
             update_sensors=False, update_human_render_cameras=True,
         )
 
+        # Canonical-view branch: render each chosen-cam rgb + position
+        # texture, fuse pointclouds, splat into num_side_cam fixed canonical
+        # viewpoints. Model sees the same canonical RGBs regardless of
+        # which physical input cams were chosen this episode.
+        if self.use_canonical_views:
+            input_pts_worlds, input_rgbs_uint8 = [], []
+            for cam_name in cam_names:
+                camera = self.env.unwrapped.scene.human_render_cameras[cam_name]
+                params = camera.get_params()
+                c2w_gl_np = _to_numpy(params["cam2world_gl"]).astype(np.float32)
+                if c2w_gl_np.ndim == 3:
+                    c2w_gl_np = c2w_gl_np[0]
+                camera.capture()
+                obs_dict = camera.get_obs(
+                    rgb=True, depth=False, position=True,
+                    segmentation=False, normal=False, albedo=False,
+                )
+                rgb_raw = obs_dict["rgb"]
+                if hasattr(rgb_raw, 'detach'):
+                    rgb_raw = rgb_raw.detach().cpu().numpy()
+                if rgb_raw.ndim == 4:
+                    rgb_raw = rgb_raw[0]
+                rgb_uint8 = (
+                    rgb_raw[..., :3].astype(np.uint8) if rgb_raw.dtype != np.float32
+                    else (rgb_raw[..., :3] * 255.0).clip(0, 255).astype(np.uint8)
+                )
+                position_texture = obs_dict["position"]
+                if position_texture.ndim == 4:
+                    position_texture = position_texture[0]
+                pts_world = self._pointmap_from_position_texture(
+                    position_texture, c2w_gl_np,
+                )  # (3, H, W) world frame
+                input_pts_worlds.append(pts_world)
+                input_rgbs_uint8.append(rgb_uint8)
+
+            canonical_rgbs = fuse_and_render_from_world_points(
+                input_pts_worlds, input_rgbs_uint8,
+                self.canonical_w2cs_cv, self.canonical_Ks,
+                H=self.image_size, W=self.image_size,
+            )
+            for i, canonical_rgb in enumerate(canonical_rgbs):
+                rgb_tensor = einops.rearrange(
+                    torch.from_numpy(canonical_rgb).float() / 255.0,
+                    'h w c -> c h w',
+                ).cuda()
+                rgb_c = self._paired_crop(rgb_tensor)
+                top, left = self._paired_crop.offsets()
+                K_c = adjust_intrinsic(self.canonical_Ks[i], top, left)
+                _, H, W = rgb_c.shape
+                # No plucker for canonical-view (geometry is in the RGB).
+                zero_plucker = torch.zeros(6, H, W, device='cuda')
+                cam_images.append(torch.cat([rgb_c, zero_plucker], dim=0))
+                # Zero pointmap placeholder — canonical baselines don't read it.
+                cam_pointmaps.append(torch.zeros(3, H, W, device='cuda'))
+                cam_extrinsics_out.append(
+                    torch.from_numpy(self.canonical_c2ws_gl[i]).float().cuda()
+                )
+                cam_intrinsics_out.append(torch.from_numpy(K_c).float().cuda())
+            cam_names = []  # skip the per-input-camera loop below
+
         for cam_name in cam_names:
             camera = self.env.unwrapped.scene.human_render_cameras[cam_name]
             params = camera.get_params()
             # get_params values can be batched (num_envs, ...); squeeze first.
-            K_np = np.asarray(params["intrinsic_cv"], dtype=np.float32)
+            K_np = _to_numpy(params["intrinsic_cv"]).astype(np.float32)
             if K_np.ndim == 3:
                 K_np = K_np[0]
-            cam2world_gl_np = np.asarray(params["cam2world_gl"], dtype=np.float32)
+            cam2world_gl_np = _to_numpy(params["cam2world_gl"]).astype(np.float32)
             if cam2world_gl_np.ndim == 3:
                 cam2world_gl_np = cam2world_gl_np[0]
 

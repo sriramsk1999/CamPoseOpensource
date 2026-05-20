@@ -26,7 +26,9 @@ _sys.path.insert(0, _REPO_ROOT)
 from campose_wrappers.articubot_dit import (
     ArticubotRoPE4DWrapper,
     ArticubotDiTSingleViewWrapper,
+    ArticubotDiTCrossViewWrapper,
 )
+from campose_wrappers.articubot_3dfa import Articubot3DFAWrapper
 
 import wandb
 
@@ -61,7 +63,15 @@ def main(args, ckpt=None):
     # Build ManiSkill environment
     env = gym.make(env_id, **env_kwargs)
     env.reset()
-    
+
+    # Canonical-view baselines (dit_dino_sv_canon / dit_dino_cv_canon) drop
+    # plucker — the canonical RGB already encodes the geometry.
+    if args.use_canonical_views:
+        assert not args.use_plucker, (
+            "--use_canonical_views=1 implies --use_plucker=0 (canonical RGB "
+            "replaces plucker as the geometric signal)"
+        )
+
     train_dataloader, val_dataloader, stats = load_data(
         args=args,
         env=env
@@ -82,27 +92,38 @@ def main(args, ckpt=None):
         policy = DiffusionPolicy(args).cuda()
     elif args.policy_class == 'smolvla':
         policy = SmolVLAPolicyWrapper(args).cuda()
-    elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv'):
+    elif args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv',
+                               'dit_dino_cv', 'flow_matching_3dfa'):
         # Maniskill Panda: eef_xyz(3) + qpos(9) = 12-dim state.
-        wrapper_cls = {
-            'dit_rope4d_dino_cv': ArticubotRoPE4DWrapper,
-            'dit_dino_sv':        ArticubotDiTSingleViewWrapper,
-        }[args.policy_class]
-        policy = wrapper_cls(
+        kwargs = dict(
             args=args,
             state_dim=3 + 9,
             action_dim=args.action_dim,
             num_cams=args.num_side_cam,
             image_size=224,
             norm_stats=stats,
-        ).cuda()
+        )
+        if args.policy_class == 'dit_rope4d_dino_cv':
+            policy = ArticubotRoPE4DWrapper(**kwargs).cuda()
+        elif args.policy_class == 'dit_dino_cv':
+            policy = ArticubotDiTCrossViewWrapper(**kwargs).cuda()
+        elif args.policy_class == 'flow_matching_3dfa':
+            policy = Articubot3DFAWrapper(**kwargs).cuda()
+        else:
+            policy = ArticubotDiTSingleViewWrapper(
+                use_plucker=args.use_plucker, **kwargs,
+            ).cuda()
     else:
         raise ValueError(f"Unsupported policy_class: {args.policy_class}")
 
     optimizer = policy.configure_optimizers()
 
-    # Flow-matching DiT policies use EMA.
-    use_ema = args.policy_class in ('dit_rope4d_dino_cv', 'dit_dino_sv')
+    # Flow-matching DiT policies use EMA. flow_matching_3dfa is excluded —
+    # ArticuBot's train_flow_matching_3dfa_workspace.yaml sets use_ema: False
+    # for this exact policy class (matches the robosuite-side decision).
+    use_ema = args.policy_class in (
+        'dit_rope4d_dino_cv', 'dit_dino_sv', 'dit_dino_cv',
+    )
     ema = None
     eval_policy = policy
     if use_ema:
@@ -243,13 +264,18 @@ if __name__ == '__main__':
                         help='Path to checkpoints directory (absolute). If None, defaults to policy_maniskill/checkpoints/<name>')
     parser.add_argument('--policy_class', type=str, default='act',
                         choices=['dp', 'act', 'smolvla',
-                                 'dit_rope4d_dino_cv', 'dit_dino_sv'],
+                                 'dit_rope4d_dino_cv', 'dit_dino_sv',
+                                 'dit_dino_cv', 'flow_matching_3dfa'],
                         help='policy class')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 
     parser.add_argument('--num_episodes', default=200, type=int, help='num_episodes')
     parser.add_argument('--use_plucker', default=True, type=str2bool, help='use Plucker embeddings')
+    parser.add_argument('--use_canonical_views', default=False, type=str2bool,
+                        help='reproject input cams into fixed canonical viewpoints '
+                             '(mirrors the robosuite-side flag for dit_dino_sv / dit_dino_cv '
+                             'canonical baselines). Implies --use_plucker 0.')
 
     # Camera pose config
     parser.add_argument('--n', type=int, default=3, help='Number of cameras per window W(i) = [m*i, m*i + n)')

@@ -162,6 +162,58 @@ def _render_canonical_view_gpu(pts_world, colors, w2c, K, H, W, fill_value=0):
     return image
 
 
+def fuse_and_render_from_world_points(
+    pts_worlds, rgbs, canonical_w2cs, canonical_Ks, H, W,
+):
+    """Variant of ``fuse_and_render`` that takes pre-unprojected world-frame
+    point clouds instead of depth+K+c2w per camera. Used by the maniskill
+    pipeline, which already has world-frame position textures from
+    SAPIEN's ``camera.get_obs(position=True)``.
+
+    Args:
+        pts_worlds: list of (3, H, W) torch/numpy arrays in world frame.
+                    Zero pixels are treated as invalid and dropped.
+        rgbs:       list of (H, W, 3) uint8 numpy/torch arrays.
+        canonical_w2cs: list of (4, 4) CV-convention w2c matrices.
+        canonical_Ks:   list of (3, 3) intrinsics.
+        H, W: output canonical image size.
+
+    Returns:
+        list of (H, W, 3) uint8 numpy arrays — one per canonical viewpoint.
+    """
+    device = torch.device(_GPU_DEVICE)
+
+    all_pts, all_colors = [], []
+    for pts_world, rgb in zip(pts_worlds, rgbs):
+        pts_t = _to_torch(pts_world, torch.float32, device)
+        if pts_t.dim() == 3:
+            # (3, H, W) → (H*W, 3)
+            pts_t = pts_t.reshape(3, -1).T
+        valid = pts_t.abs().sum(dim=-1) > 1e-6   # drop zero invalids
+        pts_t = pts_t[valid]
+
+        rgb_t = _to_torch(rgb, torch.uint8, device).reshape(-1, 3)
+        rgb_t = rgb_t[valid]
+
+        all_pts.append(pts_t)
+        all_colors.append(rgb_t)
+
+    if all_pts:
+        pts_world = torch.cat(all_pts, dim=0)
+        colors = torch.cat(all_colors, dim=0)
+    else:
+        pts_world = torch.zeros((0, 3), dtype=torch.float32, device=device)
+        colors = torch.zeros((0, 3), dtype=torch.uint8, device=device)
+
+    out = []
+    for w2c, K in zip(canonical_w2cs, canonical_Ks):
+        w2c_t = _to_torch(w2c, torch.float32, device)
+        K_t = _to_torch(K, torch.float32, device)
+        img = _render_canonical_view_gpu(pts_world, colors, w2c_t, K_t, H, W)
+        out.append(img.cpu().numpy())
+    return out
+
+
 def fuse_and_render(rgbs, depths, Ks, c2ws, canonical_w2cs, canonical_Ks, H, W):
     """Convenience: unproject N input cams, fuse, render to M canonical views.
 
