@@ -242,7 +242,12 @@ class Evaluator:
             pointmap_tensor = torch.from_numpy(pointmap_np).float().cuda()
 
             if self.args.use_plucker:
-                pl = self.plucker_embedder(K_np, c2w_gl_np)["plucker"][0]
+                # PluckerEmbedder expects batched torch tensors on GPU.
+                intrinsics_t = torch.from_numpy(K_np).unsqueeze(0).float().cuda()
+                cam_to_world_t = torch.from_numpy(c2w_gl_np).unsqueeze(0).float().cuda()
+                with torch.no_grad():
+                    plucker_data = self.plucker_embedder(intrinsics_t, cam_to_world_t)
+                    pl = plucker_data["plucker"][0]
                 plucker_tensor = einops.rearrange(pl, 'h w c -> c h w')
             else:
                 _, H, W = rgb_tensor.shape

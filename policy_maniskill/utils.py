@@ -527,7 +527,14 @@ class EpisodicDataset(Dataset):
                 pointmap_np = None
 
             if self.use_plucker:
-                pl = self.plucker_embedder(K_np, cam2world_gl_np)["plucker"][0]
+                # PluckerEmbedder.forward uses torch ops (intrinsics.size(0)) and
+                # expects batched inputs — wrap numpy in (1, *) torch tensors on
+                # GPU. Mirrors policy_robosuite/utils.py:629-633.
+                intrinsics_t = torch.from_numpy(K_np).unsqueeze(0).float().cuda()
+                cam_to_world_t = torch.from_numpy(cam2world_gl_np).unsqueeze(0).float().cuda()
+                with torch.no_grad():
+                    plucker_data = self.plucker_embedder(intrinsics_t, cam_to_world_t)
+                    pl = plucker_data["plucker"][0]
                 plucker_tensor = einops.rearrange(pl, 'h w c -> c h w')
             else:
                 _, H, W = rgb_tensor.shape
