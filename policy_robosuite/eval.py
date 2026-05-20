@@ -108,8 +108,8 @@ class Evaluator:
         # flow_matching_3dfa + dit_maniwhere_sv aren't DINO policies but reuse
         # the 224-paired-crop + depth-rendering pipeline.
         self.is_dino = getattr(args, 'policy_class', '') in (
-            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino_sv',
-            'flow_matching_3dfa', 'dit_maniwhere_sv',
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'dit_dino_cv',
+            'act_dino_sv', 'flow_matching_3dfa', 'dit_maniwhere_sv',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         # ManiWhere baseline: render move + fixed RGBD pairs at eval time, same

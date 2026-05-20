@@ -470,6 +470,74 @@ _DINOV2_BARE_CFG = {
 }
 
 
+# Cross-view DINO encoder with vanilla DINOv2 weights (NOT DA3). Keeps the
+# same alt/qknorm/rope_start=4 layout as the DA3 config (byte-compatible
+# DINOv2 layers 0..3, cross-view alternating blocks 4..11). CameraEnc off
+# because the matching dataloader path is canonical-view — the geometry
+# lives in the fixed RGBs, not in per-batch extrinsics.
+_DINO_CROSSVIEW_DINOV2_CFG = {
+    "backbone": "vitb",
+    "pretrained": True,
+    "weights_source": "dinov2",
+    "alt_start": 4,
+    "qknorm_start": 4,
+    "rope_start": 4,
+    "cat_token": True,
+    "include_camera_enc": False,
+    "camera_noise_cfg": None,
+}
+
+
+class ArticubotDiTCrossViewWrapper(_ArticubotWrapperBase):
+    """Cross-view DINO + vanilla DINOv2 weights, no plucker, no pointmap.
+
+    Designed as the fair canonical-view baseline against
+    ``ArticubotDiTSingleViewWrapper`` (``use_plucker=False``): same standard
+    DiT, same DINOv2 backbone init, only the encoder differs (single-view
+    vs cross-view alternating attention). The wrapper carries no geometry
+    obs — pair it with ``--use_canonical_views=1`` so the input RGBs
+    already encode the scene from a fixed viewpoint.
+    """
+
+    def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
+        obs = {}
+        for i in range(num_cams):
+            obs[f"cam{i}_image"] = {"shape": [3, image_size, image_size], "type": "rgb"}
+        obs["state"] = {"shape": [state_dim], "type": "low_dim"}
+        return {"obs": obs, "action": {"shape": [action_dim]}}
+
+    def _build_policy(self, shape_meta):
+        from diffusion_policy.policy.flow_matching_dit_image_policy import (
+            FlowMatchingDiTImagePolicy,
+        )
+        return FlowMatchingDiTImagePolicy(
+            shape_meta=shape_meta,
+            horizon=self.horizon,
+            n_action_steps=self.n_action_steps,
+            n_obs_steps=self.n_obs_steps,
+            visual_encoder_type="dino_crossview",
+            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DINOV2_CFG),
+            crop_shape=(self.image_size, self.image_size),
+            input_embedding_dim=_HIDDEN,
+            hidden_size=_HIDDEN,
+            pos_embed_type="none",
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
+        )
+
+    def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
+        B = noisy_actions.shape[0]
+        visual_tokens, state_tokens = policy._encode_obs(nobs, B)
+        action_features = policy.action_encoder(noisy_actions, t_disc)
+        if policy.pos_embed_type == "pos":
+            pos_ids = torch.arange(
+                action_features.shape[1],
+                dtype=torch.long, device=action_features.device,
+            )
+            action_features = action_features + policy.position_embedding(pos_ids).unsqueeze(0)
+        dit_out = policy._run_dit(action_features, visual_tokens, state_tokens, t_disc)
+        return policy.action_decoder(dit_out)
+
+
 class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
     """Trains FlowMatchingDiTImagePolicy with single-view DINOv2.
 

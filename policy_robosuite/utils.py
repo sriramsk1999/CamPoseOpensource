@@ -322,8 +322,8 @@ class EpisodicDataset(Dataset):
         # Note: flow_matching_3dfa isn't a DINO policy but reuses the same
         # 224-paired-crop + pointmap pipeline.
         self.is_dino = args.policy_class in (
-            'dit_rope4d_dino_cv', 'dit_dino_sv', 'act_dino_sv',
-            'flow_matching_3dfa', 'dit_maniwhere_sv',
+            'dit_rope4d_dino_cv', 'dit_dino_sv', 'dit_dino_cv',
+            'act_dino_sv', 'flow_matching_3dfa', 'dit_maniwhere_sv',
         )
         self.use_canonical_views = bool(getattr(args, 'use_canonical_views', False))
         # ManiWhere baseline path: per-cam render also emits a fixed-view
