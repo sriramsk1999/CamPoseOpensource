@@ -123,9 +123,15 @@ class MolmoBotWrapper(nn.Module):
         self.task_prompt = args.task_prompt
 
         from huggingface_hub import snapshot_download
-        checkpoint_path = snapshot_download("allenai/MolmoBot-DROID")
+        # MolmoBot-Img-DROID is the single-frame variant: n_obs_steps=1,
+        # single_frame=true, max_images=2 — matches CamPose's 2-cam 1-step
+        # input. The plain MolmoBot-DROID is multi-frame (4 images, 2 timesteps)
+        # and would feed our 2 single-frame inputs into a model expecting 4.
+        checkpoint_path = snapshot_download("allenai/MolmoBot-Img-DROID")
 
         log.info(f"[MolmoBotWrapper] loading from {checkpoint_path}")
+        self._print_checkpoint_config(checkpoint_path)
+
         self.policy = MolmoBotImagePolicy(
             checkpoint_path=checkpoint_path,
             train_mode=True,
@@ -141,6 +147,64 @@ class MolmoBotWrapper(nn.Module):
         )
 
         self._register_campose_stats()
+        self._verify_setup()
+
+    # ------------------------------------------------------------------ #
+    # Verification prints (first-run sanity)                              #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _print_checkpoint_config(checkpoint_path: str) -> None:
+        """V1: print key shape/normalization knobs straight from the checkpoint's
+        config.yaml so we can compare against what the wrapper assumes."""
+        import os
+        import yaml
+        cfg_path = os.path.join(checkpoint_path, "config.yaml")
+        if not os.path.isfile(cfg_path):
+            log.warning(f"[verify V1] no config.yaml at {cfg_path}")
+            return
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        m = cfg.get("model", cfg)
+        img = (m.get("mm_preprocessor") or {}).get("image") or {}
+        rp = m.get("robot_preprocessor") or {}
+        print(
+            f"[verify V1] n_obs_steps={m.get('n_obs_steps')} "
+            f"single_frame={img.get('single_frame')} "
+            f"max_images={img.get('max_images')} "
+            f"max_frames={(m.get('mm_preprocessor') or {}).get('max_frames')} "
+            f"action_dim={m.get('action_dim')} "
+            f"action_horizon={m.get('action_horizon')} "
+            f"action_norm_mode={rp.get('action_norm_mode')}"
+        )
+
+    def _verify_setup(self) -> None:
+        """V2 + V3: dump what the LoRA install + freezing actually did, so we
+        can confirm our assumptions before launching a multi-day run."""
+        from collections import Counter
+        model = self.policy.model
+
+        # V2: which modules got LoRA-adapted? Suffix counter reveals whether
+        # target_modules names matched anything (MoE blocks lack ff_proj/ff_out).
+        adapted = [n for n, mod in model.named_modules() if hasattr(mod, "lora_A")]
+        suffixes = Counter(n.rsplit(".", 1)[-1] for n in adapted)
+        print(f"[verify V2] LoRA adapted modules: {len(adapted)}  by suffix: {dict(suffixes)}")
+
+        # V3: top-level frozen vs trainable param counts. Anything trainable
+        # outside vision_backbone / LoRA / action_expert is unexpected.
+        frozen, train = Counter(), Counter()
+        for n, p in model.named_parameters():
+            top = n.split(".")[0]
+            if top == "base_model" and len(n.split(".")) > 2:
+                # peft wraps as base_model.model.<orig>; report the orig top
+                top = n.split(".")[2]
+            (train if p.requires_grad else frozen)[top] += p.numel()
+        fmt = lambda c: {k: f"{v/1e6:.1f}M" for k, v in c.items()}
+        print(f"[verify V3] frozen top-level:    {fmt(frozen)}")
+        print(f"[verify V3] trainable top-level: {fmt(train)}")
+        n_train = sum(train.values())
+        n_total = n_train + sum(frozen.values())
+        print(f"[verify V3] total trainable: {n_train/1e6:.1f}M / {n_total/1e6:.1f}M")
 
     # ------------------------------------------------------------------ #
     # Stat registration                                                   #
@@ -167,10 +231,30 @@ class MolmoBotWrapper(nn.Module):
     # ------------------------------------------------------------------ #
 
     def configure_optimizers(self):
-        # Only train params with requires_grad=True (LoRA adapters + action
-        # head; vision encoder + projector + non-LoRA LLM stay frozen).
-        trainable = [p for p in self.parameters() if p.requires_grad]
-        return torch.optim.AdamW(trainable, lr=self._lr, weight_decay=self._weight_decay)
+        # Per-group LRs from upstream MolmoBot recipe
+        # (train_molmobot.py:566-584, optim.py:66): action_expert trains at
+        # ~10x the LLM rate (1e-4 vs 1e-5). Single bundled LR starves the
+        # action head, which is the BC signal.
+        llm_params, ae_params = [], []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "action_expert" in n:
+                ae_params.append(p)
+            else:
+                llm_params.append(p)
+        n_llm = sum(p.numel() for p in llm_params)
+        n_ae = sum(p.numel() for p in ae_params)
+        print(
+            f"[MolmoBotWrapper] optimizer groups — LLM/LoRA: {n_llm/1e6:.1f}M @ lr={self._lr:.0e}, "
+            f"action_expert: {n_ae/1e6:.1f}M @ lr={self._lr * 10:.0e}"
+        )
+        return torch.optim.AdamW(
+            [
+                {"params": llm_params, "lr": self._lr,        "weight_decay": self._weight_decay},
+                {"params": ae_params,  "lr": self._lr * 10.0, "weight_decay": self._weight_decay},
+            ],
+        )
 
     # ------------------------------------------------------------------ #
     # Batch ↔ MolmoBot example-dict adaptation                            #
