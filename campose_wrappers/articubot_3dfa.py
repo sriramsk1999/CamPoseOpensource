@@ -1,56 +1,47 @@
 """3DFA (3D FlowMatch Actor) sidecar wrapper.
 
-Trains ArticuBot's ``FlowMatching3DFAImagePolicy`` (which itself wraps
-upstream 3DFA's ``DenoiseActor3D``, see
-https://github.com/nickgkan/3d_flowmatch_actor) with the CamPose train
-loops. Mirrors the pattern in ``campose_wrappers.articubot_dit`` — sidecar
-import via ``ARTICUBOT_DP``, passthrough normalizer, CamPose batch →
-ArticuBot obs adapter.
+Minimum-modification adapter from CamPose's 7-dim eef_delta action to
+ArticuBot's ``FlowMatching3DFAImagePolicy`` (which wraps upstream 3DFA's
+``DenoiseActor3D``). Mirrors the pattern in ``campose_wrappers.articubot_dit``:
+sidecar import via ``ARTICUBOT_DP``, CamPose batch → ArticuBot obs adapter.
 
-Configured for CamPose's 7-dim ``eef_delta`` action via
-``rotation_format='euler'`` (3 xyz + 3 euler + 1 grip = 7).
+Wrapper-level deltas from ArticuBot's vanilla 3DFA training (each one is a
+forced consequence of an action-representation or data-format mismatch, not
+a discretionary choice):
 
-Loss override: L1 + 30/10/1 coefs  →  normalized MSE
-----------------------------------------------------
-Three layers of disagreement on the loss for 3DFA:
+  1. ``rotation_format='euler'`` (3DFA's 7-dim path)
+     ArticuBot uses ``ortho6d`` (10-dim action: xyz + 6d_rot + grip), where
+     rotation is absolute 6d. CamPose data is 7-dim eef_delta with axis-angle
+     deltas in the rotation slot — switching to ortho6d would require
+     dataloader + env-wrapper changes. Keeping euler keeps this wrapper thin.
 
-* The paper (arXiv:2508.11002) describes L2 on velocity (pos + rot) +
-  BCE-with-logits on gripper.
-* The original 3DFA repo
-  (``3d_flowmatch_actor/modeling/policy/base_denoise_actor.py:235-239``)
-  uses ``30 * L1(pos) + 10 * L1(rot) + BCE(gripper)`` — keeps BCE on
-  gripper but uses L1 for pos/rot with hardcoded coefficients inherited
-  from 3D Diffuser Actor / PerAct.
-* The ArticuBot vendored copy at
-  ``ArticuBot/.../flowmatch_3dfa/policy/base_denoise_actor.py:230-234``
-  silently changed BCE → L1 during the port, leaving every term as L1.
+  2. ``workspace_normalizer`` = ``[mean - std, mean + std]`` per dim
+     A consequence of (1). Upstream's ``set_normalizer`` writes 3-wide
+     min/max (only xyz; ortho6d rotation is naturally bounded). With euler
+     the buffer is 6-wide, and writing raw min/max for axis-angle rot dims
+     re-introduces the wraparound-outlier collapse (0.1% of rotation
+     deltas are ±2π, squashing typical signal to ~0.0016 in [-1, +1]).
+     Setting ``_min = mean-std, _max = mean+std`` makes the model's internal
+     ``normalize_pos`` mathematically equivalent to a z-score; outliers
+     land at ~32σ (matches the z-score path the DiT/RoPE4D wrappers use)
+     without crushing typical rotations.
 
-Empirically the vendored loss collapses 3DFA on Square: xyz/rot
-under-predicted by ~5×, persistent +0.03 rot drift, success at 0%
-(diagnose_3dfa_realobs.py against a 20k-step ckpt).
+  3. RGB in [0, 1] (override of base wrapper's [-1, 1])
+     3DFA's CLIP backbone normalizes internally and expects [0, 1] input.
+     DiT-family wrappers feed [-1, 1] to DINOv2. Just a backbone mismatch.
 
-We swap to a single MSE over the full ``[pos_velocity, rot_velocity,
-openess]`` vector in normalized space, equal per-dim weighting — same
-loss shape the DiT/RoPE4D wrappers in this same codebase use, and they
-train successfully on the same dataset. Gripper stays as a regression
-target (not BCE) because (a) it kept the patch minimum-change, (b) on
-real obs the model already predicts the right gripper values for the
-phases it's seen (only the synthetic-noise "no context" prior collapsed
-in diagnose_3dfa.py), and (c) BCE would require extra inference-time
-sigmoid + scale plumbing that compute_trajectory in the vendored copy
-doesn't have. Set ``_USE_MSE_LOSS = False`` to revert.
+Loss / EMA / padding: kept identical to ArticuBot's setup.
+  - Loss: upstream ``DenoiseActor3D.compute_loss`` (vendored as
+    ``30 * L1(pos) + 10 * L1(rot) + L1(gripper)``).
+  - EMA: disabled in ``policy_robosuite/train.py``'s ``use_ema`` tuple
+    (matches ``train_flow_matching_3dfa_workspace.yaml: use_ema: False``).
+  - Padding: not masked (ArticuBot uses chunk_size=1 keypose so never has
+    padding; the ~2.9% padding fraction on our chunk_size=16 trajectories
+    is small enough to leave alone).
 """
-import types
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from campose_wrappers.articubot_dit import _ArticubotWrapperBase
-
-
-# Flip to False to restore upstream's L1 + 30/10/1 coef loss.
-_USE_MSE_LOSS = True
 
 
 # Mirror ArticuBot/diffusion_policy/config/train_flow_matching_3dfa_workspace.yaml
@@ -63,8 +54,8 @@ _TDFA_MODEL_CFG = {
     "fps_subsampling_factor": 4,
     "num_shared_attn_layers": 4,
     # eef_delta semantics: per-step delta xyz; relative=True triggers the
-    # cumsum+query path inside policy_forward_pass so RoPE3D positions
-    # land in world frame alongside the pointmap.
+    # cumsum+query path inside policy_forward_pass so RoPE3D positions land
+    # in world frame alongside the pointmap.
     "relative": True,
     # rotation_format='euler' → action_dim 7 to match CamPose eef_delta
     # [pos(3), rot(3), grip(1)]. Approximate (rotvec deltas fed into the
@@ -81,11 +72,9 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
 
     Differences from the DiT wrappers:
       - Visual input is CLIP-backbone RGB (expects [0, 1]) + per-camera
-        pointmaps. _build_ab_obs feeds RGB in [0, 1] (not [-1, 1]).
+        pointmaps. ``_build_ab_obs`` feeds RGB in [0, 1] (not [-1, 1]).
       - 3DFA computes its flow-matching loss internally; ``forward``
-        delegates to ``self.policy.compute_loss`` rather than running the
-        flow-matching loop here (cf. ``_ArticubotWrapperBase.forward``).
-      - No ``_predict_velocity`` — never used.
+        delegates to ``self.policy.compute_loss``.
     """
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
@@ -114,28 +103,14 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
         normalization, matching the LinearNormalizer-z-score path used by
         the RoPE4D / DiT-SV wrappers in this codebase.
 
-        Trick: ``normalize_pos(x) = 2*(x - _min)/(_max - _min) - 1``.
-        With ``_min = mean - std`` and ``_max = mean + std`` the denominator
-        is ``2*std`` and:
+        ``normalize_pos(x) = 2*(x - _min)/(_max - _min) - 1``. With
+        ``_min = mean - std`` and ``_max = mean + std`` the denominator is
+        ``2*std`` and the operation collapses to ``(x - mean) / std``.
 
-            normalize_pos(x)   = (x - mean) / std        # z-score
-            unnormalize_pos(z) = z*std + mean            # un-z-score
-
-        That matches the RoPE4D wrapper's normalizer and keeps every other
-        line of the 3DFA model code (cumsum, RoPE3D positions, sampler
-        ``add_noise``, etc.) untouched. Bound outliers at ~30σ rather than
-        the ~130 we got with q01/q99 — same scale the RoPE4D wrapper sees.
-
-        Reasons we don't use the policy's ``LinearNormalizer`` directly:
-        the 3DFA model carries its OWN normalize_pos call chain (inside
-        ``encode_inputs`` and ``compute_trajectory``) — to avoid double
-        normalization we would have to either rewrite the model or set the
-        workspace buffer such that the model's internal normalize is the
-        no-op. The latter is what this function does.
-
-        Note: upstream's ``set_normalizer`` only copies ``[:3]`` (xyz) into
-        the workspace buffer, but for euler the buffer is 6-wide (xyz + 3
-        euler), so doing it ourselves here is also a correctness fix.
+        Unlike upstream's ``set_normalizer`` (which writes 3-wide min/max
+        for ortho6d), we have to fill all 6 dims because rotation_format
+        is euler. Raw min/max would crush typical rotations under
+        axis-angle wraparound outliers; z-score bounds those at ~32σ.
         """
         norm_stats = self._norm_stats
         policy = self.policy
@@ -160,88 +135,6 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
             policy.model.workspace_normalizer.copy_(
                 torch.stack([action_min, action_max])
             )
-
-        if _USE_MSE_LOSS:
-            self._install_mse_loss()
-
-    def _install_mse_loss(self):
-        """Monkey-patch ``self.policy.model.compute_loss`` to use one MSE
-        over the full ``[pos_velocity, rot_velocity, openess]`` prediction
-        vector in normalized space — paper-aligned, DiT-wrapper-aligned.
-
-        Verbatim copy of upstream's compute_loss flow (encode → noise
-        schedule → policy_forward_pass → per-layer accumulation) except the
-        per-layer loss is now a single MSE over the 7-dim target.
-
-        Target construction (still normalized space, same as upstream):
-          target[..., :3] = noise[..., :3] - gt_pos    (pos velocity)
-          target[..., 3:6] = noise[..., 3:] - gt_rot   (rot velocity)
-          target[..., 6:7] = gt_openess                (gripper raw value;
-                              not noised — matches paper which uses BCE here,
-                              swap to BCE later if this still under-drives gripper)
-
-        Why monkey-patch rather than subclass: ``DenoiseActor3D`` is built
-        deep inside ``FlowMatching3DFAImagePolicy.__init__`` so subclassing
-        means duplicating that whole construction. The patch is local,
-        reversible (``_USE_MSE_LOSS = False``), and survives state_dict
-        load/save (we're only swapping a bound method, not a parameter).
-        """
-        model = self.policy.model
-
-        def compute_loss_mse(
-            self_model, gt_trajectory, rgb3d, rgb2d, pcd, proprio, is_pad=None,
-        ):
-            fixed_inputs = self_model.encode_inputs(rgb3d, rgb2d, pcd, proprio)
-
-            gt_openess = gt_trajectory[..., -1:]
-            gt_trajectory = gt_trajectory[..., :-1]
-            gt_trajectory = self_model.normalize_pos(gt_trajectory)
-            _, traj_len, nhand, _ = gt_trajectory.shape
-            gt_trajectory = self_model.convert_rot(
-                gt_trajectory.flatten(1, 2)
-            ).unflatten(1, (traj_len, nhand))
-
-            # (B, T, 1, 1) mask: 1 at real timesteps, 0 at padded ones. Padded
-            # actions are zeros from the dataloader; without masking, the
-            # model is explicitly trained to predict zero delta + zero
-            # gripper at end-of-demo timesteps. Mirrors RoPE4D wrapper.
-            if is_pad is not None:
-                mask = (~is_pad).to(gt_trajectory.dtype)[:, :, None, None]
-            else:
-                mask = torch.ones(
-                    gt_trajectory.shape[0], traj_len, 1, 1,
-                    device=gt_trajectory.device, dtype=gt_trajectory.dtype,
-                )
-
-            total_loss = 0
-            for _ in range(self_model._lv2_batch_size):
-                noise = torch.randn(gt_trajectory.shape, device=gt_trajectory.device)
-                timesteps = self_model.position_scheduler.sample_noise_step(
-                    num_noise=len(noise), device=noise.device,
-                )
-                pos = self_model.position_scheduler.add_noise(
-                    gt_trajectory[..., :3], noise[..., :3], timesteps,
-                )
-                rot = self_model.rotation_scheduler.add_noise(
-                    gt_trajectory[..., 3:], noise[..., 3:], timesteps,
-                )
-                noisy_trajectory = torch.cat((pos, rot), -1)
-                pred = self_model.policy_forward_pass(
-                    noisy_trajectory, timesteps, fixed_inputs,
-                )
-                denoise_target = self_model.position_scheduler.prepare_target(
-                    noise, gt_trajectory,
-                )  # (B, T, 1, 6) = velocity targets for [pos, rot]
-                # Concat with gripper raw value to form a single (B, T, 1, 7)
-                # target matching layer_pred's [pos_v, rot_v, openess] layout.
-                full_target = torch.cat([denoise_target, gt_openess], dim=-1)
-                for layer_pred in pred:
-                    sq = (layer_pred - full_target) ** 2 * mask
-                    denom = mask.sum().clamp_min(1.0) * layer_pred.shape[-1]
-                    total_loss = total_loss + sq.sum() / denom
-            return total_loss / self_model._lv2_batch_size
-
-        model.compute_loss = types.MethodType(compute_loss_mse, model)
 
     # 3DFA's CLIP encoder expects RGB in [0, 1]; override the base wrapper's
     # [-1, 1] conversion to skip that step. Pointmap is added separately.
@@ -282,18 +175,12 @@ class Articubot3DFAWrapper(_ArticubotWrapperBase):
 
         obs = self._build_ab_obs(batch, norm_stats)
         actions_raw = self._actions_raw(batch, norm_stats)
-        is_pad = batch["is_pad"][:, : self.horizon]   # (B, T) bool
         assert actions_raw.shape[1] == self.horizon, (
             "max_seq_length < horizon — re-export dataset or lower --horizon"
         )
 
-        # Bypass FlowMatching3DFAImagePolicy.compute_loss so we can pass
-        # is_pad through to the model's monkey-patched compute_loss_mse
-        # (the upstream policy.compute_loss doesn't know about masking).
-        # Mirrors what policy.compute_loss does otherwise.
-        rgb3d, rgb2d, pcd, proprio = self.policy._build_3dfa_inputs(obs)
-        gt_trajectory = actions_raw.unsqueeze(2).contiguous()   # (B, T, 1, 7)
-        loss = self.policy.model.compute_loss(
-            gt_trajectory, rgb3d, rgb2d, pcd, proprio, is_pad=is_pad,
-        )
+        # 3DFA bypasses ``policy.normalizer`` for actions — its
+        # ``compute_loss`` feeds raw deltas straight to the model, which
+        # runs ``normalize_pos`` against ``workspace_normalizer`` instead.
+        loss = self.policy.compute_loss({"obs": obs, "action": actions_raw})
         return {"loss": loss}
