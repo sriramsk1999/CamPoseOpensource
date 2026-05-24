@@ -1,8 +1,8 @@
 """ManiWhere (Yuan et al., 2024) sidecar wrapper.
 
-Pairs ArticuBot's ``FlowMatchingDiTImagePolicy`` (vanilla DiT action head)
-with the vendored ManiWhere visual encoder + auxiliary losses (see
-``diffusion_policy/model/maniwhere/`` and ``visual_encoders/maniwhere``).
+Pairs ArticuBot's ``FlowMatchingAdditivePosDiTImagePolicy`` (additive-pos DiT
+action head) with the vendored ManiWhere visual encoder + auxiliary losses
+(see ``diffusion_policy/model/maniwhere/`` and ``visual_encoders/maniwhere``).
 ManiWhere is RL-published; this wrapper trains its visual representation
 contribution via BC over CamPose demos. The auxiliary InfoNCE / L2 losses
 are computed across the (move, fixed) view pair the dataloader emits.
@@ -30,7 +30,7 @@ import torch.nn as nn
 
 from campose_wrappers.articubot_dit import (
     _ArticubotWrapperBase,
-    _DIFFUSION_MODEL_CFG_RGB,
+    _DIFFUSION_MODEL_CFG_ADDITIVE,
     _HIDDEN,
 )
 
@@ -58,7 +58,7 @@ _MANIWHERE_ENCODER_CFG = {
 
 
 class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
-    """dit_maniwhere_sv: vanilla DiT + ManiWhere ResNet18+STN encoder + aux losses."""
+    """dit_maniwhere_sv: additive-pos DiT + ManiWhere ResNet18+STN encoder + aux losses."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -147,10 +147,10 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
     def _build_policy(self, shape_meta):
-        from diffusion_policy.policy.flow_matching_dit_image_policy import (
-            FlowMatchingDiTImagePolicy,
+        from diffusion_policy.policy.flow_matching_additive_pos_dit_image_policy import (
+            FlowMatchingAdditivePosDiTImagePolicy,
         )
-        return FlowMatchingDiTImagePolicy(
+        return FlowMatchingAdditivePosDiTImagePolicy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
@@ -160,8 +160,7 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
-            pos_embed_type="none",
-            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ADDITIVE),
         )
 
     def _build_ab_obs(self, batch, norm_stats):
@@ -248,15 +247,10 @@ class ArticubotManiWhereWrapper(_ArticubotWrapperBase):
 
         # Encoder forward (move keys only — the encoder reuses this internally
         # when compute_aux_losses runs below). Identical to the SingleView
-        # wrapper's _predict_velocity path.
+        # wrapper's _predict_velocity path; AdditivePosDiT applies positional
+        # embeds internally so we hand action_features through unchanged.
         visual_tokens, state_tokens = policy._encode_obs(nobs, B)
         action_features = policy.action_encoder(noisy_actions, t_disc)
-        if policy.pos_embed_type == "pos":
-            pos_ids = torch.arange(
-                action_features.shape[1],
-                dtype=torch.long, device=action_features.device,
-            )
-            action_features = action_features + policy.position_embedding(pos_ids).unsqueeze(0)
         dit_out = policy._run_dit(action_features, visual_tokens, state_tokens, t_disc)
         pred_velocity = policy.action_decoder(dit_out)
 

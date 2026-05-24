@@ -1,14 +1,22 @@
 """Adapters that train ArticuBot's flow-matching DiT policies with the
 CamPose train loops in ``policy_robosuite/`` and ``policy_maniskill/``.
 
-Two variants are exposed (= the two GROOT baselines we evaluate against):
+Variants exposed (= the GROOT baselines we evaluate against):
   - ``ArticubotRoPE4DWrapper``         → FlowMatchingRoPE4DDiTImagePolicy
                                           (GROOT-DINO-CV-RoPE4D: RoPE4D DiT +
                                           DA3 cross-view DINO with CameraEnc +
                                           pointmap geometry)
-  - ``ArticubotDiTSingleViewWrapper``  → FlowMatchingDiTImagePolicy
-                                          (GROOT-DINO-SV-Plucker: vanilla DiT +
-                                          single-view DINOv2 + Plucker ViT)
+  - ``ArticubotDiTCrossViewWrapper``   → FlowMatchingAdditivePosDiTImagePolicy
+                                          (GROOT-DINO-CV: additive-pos DiT +
+                                          cross-view DINO, canonical-view path)
+  - ``ArticubotDiTSingleViewWrapper``  → FlowMatchingAdditivePosDiTImagePolicy
+                                          (GROOT-DINO-SV[-Plucker]: additive-pos
+                                          DiT + single-view DINOv2 [+ Plucker ViT])
+
+The two non-RoPE4D variants share upstream's
+``train_flow_matching_additive_pos_dit_workspace.yaml`` recipe — same DiT,
+2D-sinusoidal patch-grid embed on visual tokens and 1D-sinusoidal embed on
+state+action tokens, all owned by the DiT (visual encoder untouched).
 
 ArticuBot is imported as a sidecar package (no vendoring) — set the
 ``ARTICUBOT_DP`` env var to the ``ArticuBot/diffusion_policy`` directory
@@ -118,14 +126,14 @@ def _build_normalizer(shape_meta, norm_stats):
     return norm
 
 
-# Match ArticuBot/diffusion_policy/config/train_flow_matching_{,rope4d_}dit_workspace.yaml.
+# Match ArticuBot/diffusion_policy/config/train_flow_matching_{additive_pos_,rope4d_}dit_workspace.yaml.
 _HIDDEN = 1024
 _HEAD_DIM = 64
 _NUM_LAYERS = 12
 
-# Shared DiT params (both FlowMatchingDiTImagePolicy and FlowMatchingRoPE4DDiTImagePolicy).
-# Default output_dim=26 is hardcoded for an ArticuBot task; override to hidden_size
-# so action_decoder (in_dim=hidden_size) matches DiT output.
+# Shared by both DiT flavors. Default output_dim=26 is hardcoded for an
+# ArticuBot task; override to hidden_size so action_decoder (in_dim=hidden_size)
+# matches DiT output.
 _DIFFUSION_MODEL_CFG_BASE = {
     "num_attention_heads": _HIDDEN // _HEAD_DIM,
     "attention_head_dim": _HEAD_DIM,
@@ -133,14 +141,20 @@ _DIFFUSION_MODEL_CFG_BASE = {
     "num_layers": _NUM_LAYERS,
 }
 
-# RGB variant adds interleave_self_attention=True (BasicTransformerBlock-based DiT).
-_DIFFUSION_MODEL_CFG_RGB = {
+# AdditivePosDiT variant (FlowMatchingAdditivePosDiTImagePolicy). Mirrors the
+# upstream additive_pos_dit_workspace.yaml: dual self+cross per block, sinusoidal
+# 1D pos on state+action tokens, 2D sinusoidal pos on visual patches (the latter
+# defaulted by the policy from crop_shape).
+_DIFFUSION_MODEL_CFG_ADDITIVE = {
     **_DIFFUSION_MODEL_CFG_BASE,
-    "interleave_self_attention": True,
+    "cross_attention_first": False,
+    "alternating_attention": False,
+    "pos_embed_type": "sinusoidal",
+    # Upper bound on n_obs_steps + horizon; matches upstream's headroom.
+    "max_seq_length": 64,
 }
 
-# RoPE4D variant adds RoPE4D-specific base_frequency. interleave_self_attention is
-# rejected by RoPE4DDiT's constructor, so it does NOT inherit _DIFFUSION_MODEL_CFG_RGB.
+# RoPE4D variant adds RoPE4D-specific base_frequency.
 _DIFFUSION_MODEL_CFG_ROPE4D = {
     **_DIFFUSION_MODEL_CFG_BASE,
     "base_frequency": 100.0,
@@ -507,10 +521,10 @@ class ArticubotDiTCrossViewWrapper(_ArticubotWrapperBase):
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
     def _build_policy(self, shape_meta):
-        from diffusion_policy.policy.flow_matching_dit_image_policy import (
-            FlowMatchingDiTImagePolicy,
+        from diffusion_policy.policy.flow_matching_additive_pos_dit_image_policy import (
+            FlowMatchingAdditivePosDiTImagePolicy,
         )
-        return FlowMatchingDiTImagePolicy(
+        return FlowMatchingAdditivePosDiTImagePolicy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
@@ -520,26 +534,23 @@ class ArticubotDiTCrossViewWrapper(_ArticubotWrapperBase):
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
-            pos_embed_type="none",
-            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ADDITIVE),
         )
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
+        # AdditivePosDiT owns all positional embeddings (1D sinusoidal on
+        # state+action stream, 2D sinusoidal on visual patches) — applied
+        # internally inside policy.model.forward, so the wrapper just hands
+        # action_features through.
         B = noisy_actions.shape[0]
         visual_tokens, state_tokens = policy._encode_obs(nobs, B)
         action_features = policy.action_encoder(noisy_actions, t_disc)
-        if policy.pos_embed_type == "pos":
-            pos_ids = torch.arange(
-                action_features.shape[1],
-                dtype=torch.long, device=action_features.device,
-            )
-            action_features = action_features + policy.position_embedding(pos_ids).unsqueeze(0)
         dit_out = policy._run_dit(action_features, visual_tokens, state_tokens, t_disc)
         return policy.action_decoder(dit_out)
 
 
 class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
-    """Trains FlowMatchingDiTImagePolicy with single-view DINOv2.
+    """Trains FlowMatchingAdditivePosDiTImagePolicy with single-view DINOv2.
 
     With ``use_plucker=True`` (default, GROOT-DINO-SV-Plucker): each camera is
     encoded by a partially fine-tuned DINOv2; sibling Plucker ViT tokens are
@@ -565,12 +576,12 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
     def _build_policy(self, shape_meta):
-        from diffusion_policy.policy.flow_matching_dit_image_policy import (
-            FlowMatchingDiTImagePolicy,
+        from diffusion_policy.policy.flow_matching_additive_pos_dit_image_policy import (
+            FlowMatchingAdditivePosDiTImagePolicy,
         )
         encoder_type = "dinov2_plucker" if self._use_plucker else "dinov2"
         encoder_cfg = dict(_DINOV2_PLUCKER_CFG if self._use_plucker else _DINOV2_BARE_CFG)
-        return FlowMatchingDiTImagePolicy(
+        return FlowMatchingAdditivePosDiTImagePolicy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
@@ -580,8 +591,7 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
-            pos_embed_type="none",
-            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_RGB),
+            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ADDITIVE),
         )
 
     def _add_geometry_obs(self, obs, batch, n_cams):
@@ -593,14 +603,10 @@ class ArticubotDiTSingleViewWrapper(_ArticubotWrapperBase):
             obs[f"cam{i}_plucker"] = plucker[:, i].unsqueeze(1)
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
+        # AdditivePosDiT owns all positional embeddings — see the cross-view
+        # wrapper for the matching note.
         B = noisy_actions.shape[0]
         visual_tokens, state_tokens = policy._encode_obs(nobs, B)
         action_features = policy.action_encoder(noisy_actions, t_disc)
-        if policy.pos_embed_type == "pos":
-            pos_ids = torch.arange(
-                action_features.shape[1],
-                dtype=torch.long, device=action_features.device,
-            )
-            action_features = action_features + policy.position_embedding(pos_ids).unsqueeze(0)
         dit_out = policy._run_dit(action_features, visual_tokens, state_tokens, t_disc)
         return policy.action_decoder(dit_out)
