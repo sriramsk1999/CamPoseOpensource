@@ -3,15 +3,20 @@ CamPose train loops in ``policy_robosuite/`` and ``policy_maniskill/``.
 
 Variants exposed (= the GROOT baselines we evaluate against):
   - ``ArticubotRoPE4DWrapper``         → FlowMatchingRoPE4DDiTImagePolicy
-                                          (GROOT-DINO-CV-RoPE4D: RoPE4D DiT +
-                                          DA3 cross-view DINO with CameraEnc +
-                                          pointmap geometry)
+                                          (VGP: RoPE4D DiT + cross-view DINO +
+                                          pointmap geometry, noisy-action token
+                                          positions)
   - ``ArticubotDiTCrossViewWrapper``   → FlowMatchingAdditivePosDiTImagePolicy
                                           (GROOT-DINO-CV: additive-pos DiT +
-                                          cross-view DINO, canonical-view path)
+                                          cross-view DINO; canonical-view or
+                                          Plucker-raymap path)
   - ``ArticubotDiTSingleViewWrapper``  → FlowMatchingAdditivePosDiTImagePolicy
                                           (GROOT-DINO-SV[-Plucker]: additive-pos
                                           DiT + single-view DINOv2 [+ Plucker ViT])
+
+The three Table-1 arms (Canonical Views / Plucker Raymaps / VGP) all run on
+the *same* cross-view DINOv2 encoder, so the only thing that varies across
+rows is how camera pose reaches the policy. See ``_DINO_CROSSVIEW_DINOV2_CFG``.
 
 The two non-RoPE4D variants share upstream's
 ``train_flow_matching_additive_pos_dit_workspace.yaml`` recipe — same DiT,
@@ -160,11 +165,46 @@ _DIFFUSION_MODEL_CFG_ROPE4D = {
     "base_frequency": 100.0,
 }
 
-# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview_da3.yaml
-# (the DepthAnything3-pretrained variant — alt/qknorm/rope_start pinned to 4 for
-# byte-compatible state_dict load, no camera noise). Override include_camera_enc
-# because the GROOT-DINO-CV-RoPE4D baseline uses CameraEnc (geometry-aware
-# camera tokens injected at alt_start).
+# Mirror ArticuBot/diffusion_policy/config/visual_encoder/dino_crossview.yaml,
+# with alt/qknorm/rope_start overridden 6 → 4 exactly as ArticuBot's own
+# paper/icra/ scripts do. This is the shared encoder for all three Table-1
+# arms: DINOv2 ViT-B init, cross-view alternating attention from block 4,
+# blocks 0-3 frozen.
+#
+# CameraEnc is off. In VGP the geometry reaches the DiT as RoPE4D positions
+# built from the pointmap, not as encoder-side camera tokens; in the canonical
+# and Plucker arms it reaches the encoder through the images themselves.
+_DINO_CROSSVIEW_DINOV2_CFG = {
+    "backbone": "vitb",
+    "pretrained": True,
+    "weights_source": "dinov2",
+    "alt_start": 4,
+    "qknorm_start": 4,
+    "rope_start": 4,
+    "cat_token": True,
+    "include_camera_enc": False,
+    "camera_noise_cfg": None,
+}
+
+# Plucker arm: same backbone, plus a from-scratch Plucker ViT whose tokens are
+# concatenated channel-wise with the DINO tokens and projected down
+# (arXiv:2510.02268). Consumed by campose_wrappers/crossview_plucker.py — the
+# encoder is local to CamPose, so there is no upstream yaml to mirror.
+_DINO_CROSSVIEW_PLUCKER_CFG = {
+    **_DINO_CROSSVIEW_DINOV2_CFG,
+    "plucker_vit_cfg": {
+        "patch_size": 14,
+        "embed_dim": 384,
+        "depth": 4,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+    },
+}
+
+# Superseded: the DepthAnything3-pretrained cross-view encoder with CameraEnc.
+# The ICRA resubmission drops DA3 (ArticuBot paper/icra/README.md), so nothing
+# builds this any more — it is kept because the earlier
+# dit_rope4d_dino_cv_square_seed_0 checkpoints were trained with it.
 _DINO_CROSSVIEW_DA3_CFG = {
     "backbone": "vitb",
     "pretrained": True,
@@ -394,12 +434,16 @@ class _ArticubotWrapperBase(nn.Module):
 
 
 class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
-    """GROOT-DINO-CV-RoPE4D: RoPE4D DiT + DA3-pretrained cross-view DINO.
+    """VGP: RoPE4D DiT + cross-view DINOv2, noisy-action token positions.
 
-    Mirrors ArticuBot's ``visual_encoder=dino_crossview_da3`` +
-    ``train_flow_matching_rope4d_dit_workspace`` recipe, with CameraEnc
-    enabled and the auxiliary pointmap loss disabled. The DA3 path also
-    loads pretrained CameraEnc weights (see ``load_pretrained_da3_cam_enc``).
+    Mirrors ArticuBot's ``visual_encoder=dino_crossview`` +
+    ``train_flow_matching_rope4d_dit_workspace`` recipe with
+    ``alt/qknorm/rope_start=4``, ``action_pos_mode=cumsum`` and
+    ``xyz_scale=100`` — i.e. the arm ArticuBot's paper/icra/README.md defines
+    as VGP (0.644 +/- 0.008 on Cabinet). The auxiliary pointmap loss is off.
+
+    Superseded: this used to build the DepthAnything3 encoder with CameraEnc
+    (``_DINO_CROSSVIEW_DA3_CFG``); the ICRA resubmission drops DA3.
     """
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
@@ -422,7 +466,7 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
             visual_encoder_type="dino_crossview",
-            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DA3_CFG),
+            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DINOV2_CFG),
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
@@ -432,6 +476,11 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
             # step indices over n_obs_steps + horizon.
             xyz_scale=100.0,
             time_scale=18.0,
+            # Anchor action tokens on the current noisy trajectory estimate
+            # (gripper + cumsum of the in-flight deltas). The policy's own
+            # default is "blended", which is a *different* ablation arm — VGP
+            # is cumsum, so pass it explicitly rather than inheriting.
+            action_pos_mode="cumsum",
             # Aux pointmap loss intentionally disabled — flip on by passing a
             # weight (e.g. 0.1) to mirror the ArticuBot reference run.
             aux_pointmap_loss_weight=None,
@@ -484,39 +533,37 @@ _DINOV2_BARE_CFG = {
 }
 
 
-# Cross-view DINO encoder with vanilla DINOv2 weights (NOT DA3). Keeps the
-# same alt/qknorm/rope_start=4 layout as the DA3 config (byte-compatible
-# DINOv2 layers 0..3, cross-view alternating blocks 4..11). CameraEnc off
-# because the matching dataloader path is canonical-view — the geometry
-# lives in the fixed RGBs, not in per-batch extrinsics.
-_DINO_CROSSVIEW_DINOV2_CFG = {
-    "backbone": "vitb",
-    "pretrained": True,
-    "weights_source": "dinov2",
-    "alt_start": 4,
-    "qknorm_start": 4,
-    "rope_start": 4,
-    "cat_token": True,
-    "include_camera_enc": False,
-    "camera_noise_cfg": None,
-}
-
-
 class ArticubotDiTCrossViewWrapper(_ArticubotWrapperBase):
-    """Cross-view DINO + vanilla DINOv2 weights, no plucker, no pointmap.
+    """GROOT-DINO-CV: additive-pos DiT + cross-view DINOv2. No pointmap.
 
-    Designed as the fair canonical-view baseline against
-    ``ArticubotDiTSingleViewWrapper`` (``use_plucker=False``): same standard
-    DiT, same DINOv2 backbone init, only the encoder differs (single-view
-    vs cross-view alternating attention). The wrapper carries no geometry
-    obs — pair it with ``--use_canonical_views=1`` so the input RGBs
-    already encode the scene from a fixed viewpoint.
+    Two Table-1 arms share this wrapper; ``use_plucker`` selects between them,
+    and everything else (DiT, backbone init, optimizer) is held fixed:
+
+    ``use_plucker=False`` — Canonical Views. Pair with
+        ``--use_canonical_views=1`` so the dataloader reprojects the chosen
+        cameras into fixed canonical viewpoints; the geometry is then already
+        baked into the RGB the encoder sees, and no pose enters the model.
+
+    ``use_plucker=True`` — Plucker Raymaps. Chosen-camera RGB as-is, with the
+        6-channel raymap carried alongside and fused into the patch tokens by
+        the encoder (channel concat + project down).
+
+    Against ``ArticubotRoPE4DWrapper`` (VGP, same encoder) these isolate *how
+    camera pose reaches the policy*, not which backbone encodes the image.
     """
+
+    def __init__(self, *args, use_plucker: bool = False, **kwargs):
+        self._use_plucker = use_plucker
+        super().__init__(*args, **kwargs)
 
     def _build_shape_meta(self, num_cams, image_size, state_dim, action_dim):
         obs = {}
         for i in range(num_cams):
+            # cam{i}_image must stay first — the policy reads in_channels off
+            # the first visual key.
             obs[f"cam{i}_image"] = {"shape": [3, image_size, image_size], "type": "rgb"}
+            if self._use_plucker:
+                obs[f"cam{i}_plucker"] = {"shape": [6, image_size, image_size], "type": "plucker"}
         obs["state"] = {"shape": [state_dim], "type": "low_dim"}
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
@@ -524,18 +571,46 @@ class ArticubotDiTCrossViewWrapper(_ArticubotWrapperBase):
         from diffusion_policy.policy.flow_matching_additive_pos_dit_image_policy import (
             FlowMatchingAdditivePosDiTImagePolicy,
         )
-        return FlowMatchingAdditivePosDiTImagePolicy(
+        encoder_cfg = dict(_DINO_CROSSVIEW_DINOV2_CFG)
+        if self._use_plucker:
+            # The plucker encoder is local to CamPose (see crossview_plucker.py
+            # for why), so it cannot be named through upstream's registry. The
+            # policy builds a plain cross-view encoder that we then replace —
+            # skip its pretrained load, since the encoder we keep does its own.
+            encoder_cfg["pretrained"] = False
+
+        policy = FlowMatchingAdditivePosDiTImagePolicy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
             visual_encoder_type="dino_crossview",
-            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DINOV2_CFG),
+            visual_encoder_cfg=encoder_cfg,
             crop_shape=(self.image_size, self.image_size),
             input_embedding_dim=_HIDDEN,
             hidden_size=_HIDDEN,
             diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ADDITIVE),
         )
+        if self._use_plucker:
+            from campose_wrappers.crossview_plucker import install_plucker_encoder
+            install_plucker_encoder(
+                policy,
+                cam_keys=policy.visual_obs_keys,
+                encoder_cfg=dict(_DINO_CROSSVIEW_PLUCKER_CFG),
+                n_obs_steps=self.n_obs_steps,
+                embed_dim=_HIDDEN,
+                crop_shape=(self.image_size, self.image_size),
+                image_size=self.image_size,
+            )
+        return policy
+
+    def _add_geometry_obs(self, obs, batch, n_cams):
+        if not self._use_plucker:
+            return
+        # Channels 3-9 of the CamPose-loader 9-channel image are 6-D Plucker rays.
+        plucker = batch["image"][:, :, 3:9]      # (B, n_cams, 6, H, W)
+        for i in range(n_cams):
+            obs[f"cam{i}_plucker"] = plucker[:, i].unsqueeze(1)
 
     def _predict_velocity(self, policy, nobs, obs, noisy_actions, t_disc, t_cont=None):
         # AdditivePosDiT owns all positional embeddings (1D sinusoidal on

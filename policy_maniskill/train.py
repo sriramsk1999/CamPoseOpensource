@@ -106,7 +106,9 @@ def main(args, ckpt=None):
         if args.policy_class == 'dit_rope4d_dino_cv':
             policy = ArticubotRoPE4DWrapper(**kwargs).cuda()
         elif args.policy_class == 'dit_dino_cv':
-            policy = ArticubotDiTCrossViewWrapper(**kwargs).cuda()
+            policy = ArticubotDiTCrossViewWrapper(
+                use_plucker=args.use_plucker, **kwargs,
+            ).cuda()
         elif args.policy_class == 'flow_matching_3dfa':
             policy = Articubot3DFAWrapper(**kwargs).cuda()
         else:
