@@ -26,8 +26,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 REPO_ROOT="$PWD"
 
-ARM="${1:?usage: GPU=<n> paper/square/table1.sh <canonical|plucker|vgp> <seed>}"
-SEED="${2:?usage: GPU=<n> paper/square/table1.sh <canonical|plucker|vgp> <seed>}"
+ARM="${1:?usage: GPU=<n> paper/square/table1.sh <arm> <seed>  (see case block)}"
+SEED="${2:?usage: GPU=<n> paper/square/table1.sh <arm> <seed>}"
 GPU="${GPU:-0}"
 EPOCHS="${EPOCHS:-30001}"
 BATCH_SIZE="${BATCH_SIZE:-35}"
@@ -36,11 +36,25 @@ EVAL_EPISODES="${EVAL_EPISODES:-10}"
 EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-600}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# Same arms as paper/square/grogu.slurm -- keep the two in sync. Everything
+# not named in an arm's block stays at the VGP configuration.
+POLICY_CLASS=dit_rope4d_dino_cv; USE_PLUCKER=0; USE_CANON=0; EXTRA=()
 case "$ARM" in
-    canonical) POLICY_CLASS=dit_dino_cv;         USE_PLUCKER=0; USE_CANON=1 ;;
-    plucker)   POLICY_CLASS=dit_dino_cv;         USE_PLUCKER=1; USE_CANON=0 ;;
-    vgp)       POLICY_CLASS=dit_rope4d_dino_cv;  USE_PLUCKER=0; USE_CANON=0 ;;
-    *) echo "unknown arm: $ARM (expected canonical|plucker|vgp)" >&2; exit 1 ;;
+    # --- Table 1 -----------------------------------------------------------
+    vgp)              ;;
+    plucker)          POLICY_CLASS=dit_dino_cv; USE_PLUCKER=1 ;;
+    canonical)        POLICY_CLASS=dit_dino_cv; USE_CANON=1 ;;
+    # --- Table 2 -----------------------------------------------------------
+    dp)               POLICY_CLASS=dp ;;
+    act)              POLICY_CLASS=act ;;
+    vgp_sinusoidal)   POLICY_CLASS=dit_dino_cv ;;
+    spatial_softmax)  EXTRA=(--visual_token_compression softmax) ;;
+    max_pool)         EXTRA=(--visual_token_compression max) ;;
+    resnet18)         EXTRA=(--visual_encoder resnet18) ;;
+    dinov2_frozen)    EXTRA=(--visual_encoder dinov2_frozen) ;;
+    dinov2_finetuned) EXTRA=(--visual_encoder dinov2_finetuned) ;;
+    rope3d)           EXTRA=(--pos_encoding rope3d) ;;
+    *) echo "unknown arm: $ARM" >&2; exit 1 ;;
 esac
 
 # train.py derives the wandb group as name[:-7], so the name MUST end in
@@ -92,6 +106,7 @@ CMD=(python "$REPO_ROOT/policy_robosuite/train.py"
     --eval_every 1000 --eval_start_epoch 1000
     --eval_episodes "$EVAL_EPISODES" --eval_max_steps "$EVAL_MAX_STEPS"
     --eval_save_n_video 10
+    "${EXTRA[@]}"
 )
 
 if [ "$DRY_RUN" != "0" ]; then

@@ -327,6 +327,22 @@ if __name__ == '__main__':
                                  'flow_matching_3dfa', 'dit_maniwhere_sv',
                                  'molmobot'],
                         help='policy class')
+    # Table-2 ablation knobs for dit_rope4d_dino_cv (VGP). Defaults = VGP.
+    parser.add_argument('--visual_encoder', type=str, default='dino_crossview',
+                        choices=['dino_crossview', 'dinov2_finetuned',
+                                 'dinov2_frozen', 'resnet18'],
+                        help='visual encoder for dit_rope4d_dino_cv; '
+                             'dino_crossview is VGP, the rest are the Table-2 '
+                             'visual-encoder ablations')
+    parser.add_argument('--visual_token_compression', type=str, default='none',
+                        choices=['none', 'softmax', 'max', 'density'],
+                        help='how per-patch visual tokens are pooled before the '
+                             'DiT; none is VGP, softmax/max are the Table-2 '
+                             'compression ablations')
+    parser.add_argument('--pos_encoding', type=str, default='rope4d',
+                        choices=['rope4d', 'rope3d'],
+                        help='positional encoding for dit_rope4d_dino_cv; '
+                             'rope3d drops the temporal axis (Table-2 row)')
     parser.add_argument('--horizon', default=16, type=int, help='action horizon for flow-matching DiT policies')
     parser.add_argument('--n_action_steps', default=8, type=int, help='number of action steps executed per inference')
 

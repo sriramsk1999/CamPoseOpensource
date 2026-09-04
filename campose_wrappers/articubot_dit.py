@@ -247,6 +247,7 @@ class _ArticubotWrapperBase(nn.Module):
     def __init__(self, args, state_dim, action_dim, num_cams, image_size,
                  norm_stats=None):
         super().__init__()
+        self._args = args
         self._norm_stats = norm_stats or {}
         self._lr = float(args.lr)
         self._weight_decay = float(args.weight_decay)
@@ -433,6 +434,34 @@ class _ArticubotWrapperBase(nn.Module):
         return self._zscore_actions(raw_actions, norm_stats)
 
 
+def _vgp_encoder(name):
+    """Table-2 visual-encoder arms: name -> (encoder_type, cfg, policy kwargs).
+
+    A function rather than a module-level dict so it can reference configs
+    defined further down the file. Each mirrors an ArticuBot
+    config/visual_encoder/*.yaml; only the VGP row uses cross-view.
+    """
+    if name == "dino_crossview":                     # VGP (ours)
+        return "dino_crossview", _DINO_CROSSVIEW_DINOV2_CFG, {}
+    if name == "dinov2_finetuned":                   # dinov2_partial.yaml
+        return "dinov2", _DINOV2_BARE_CFG, {}
+    if name == "dinov2_frozen":                      # dinov2.yaml
+        return "dinov2", {"model_name": "facebook/dinov2-base", "frozen": True}, {}
+    if name == "resnet18":                           # resnet.yaml
+        # patch_size MUST be 32. The policy re-derives token positions from
+        # the pointmap with _extract_patch_centers, so the default 14
+        # (ViT-B/14) produces a token count that mismatches ResNet-18's 7x7
+        # output stride and training dies. Same trap as ArticuBot's
+        # paper/grogu/ablation.slurm.
+        return ("resnet",
+                {"backbone": "resnet18", "pretrained": True, "use_group_norm": True},
+                {"patch_size": 32, "use_separate_wrist_encoder": False})
+    raise ValueError(
+        f"unknown visual_encoder {name!r}; expected one of dino_crossview, "
+        f"dinov2_finetuned, dinov2_frozen, resnet18"
+    )
+
+
 class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
     """VGP: RoPE4D DiT + cross-view DINOv2, noisy-action token positions.
 
@@ -457,20 +486,58 @@ class ArticubotRoPE4DWrapper(_ArticubotWrapperBase):
         return {"obs": obs, "action": {"shape": [action_dim]}}
 
     def _build_policy(self, shape_meta):
-        from diffusion_policy.policy.flow_matching_rope4d_dit_image_policy import (
-            FlowMatchingRoPE4DDiTImagePolicy,
-        )
-        return FlowMatchingRoPE4DDiTImagePolicy(
+        # Table-2 ablation knobs. Defaults reproduce VGP, so an unset arg (e.g.
+        # from policy_maniskill/train.py, whose parser does not define these)
+        # gives the paper configuration.
+        a = self._args
+        enc_name = getattr(a, "visual_encoder", "dino_crossview")
+        compression = getattr(a, "visual_token_compression", "none")
+        pos_encoding = getattr(a, "pos_encoding", "rope4d")
+        enc_type, enc_cfg, enc_kwargs = _vgp_encoder(enc_name)
+
+        hidden = _HIDDEN
+        dit_cfg = dict(_DIFFUSION_MODEL_CFG_ROPE4D)
+        if pos_encoding == "rope3d":
+            # Same policy with the temporal axis dropped from every RoPE
+            # position; it subclasses the RoPE4D one, so the kwargs and the
+            # wrapper's _predict_velocity are unchanged.
+            #
+            # It does NOT run at the same width: 3D RoPE splits head_dim over
+            # 3 axes and asserts head_dim % 6 == 0, which the 64 used
+            # everywhere else fails. Upstream's rope3d workspace resolves this
+            # with hidden 1008 / head_dim 72 (14 heads); mirror it exactly, or
+            # the arm dies in the DiT constructor.
+            hidden = 1008
+            dit_cfg.update({
+                "attention_head_dim": 72,
+                "num_attention_heads": hidden // 72,
+                "output_dim": hidden,
+            })
+            from diffusion_policy.policy.flow_matching_rope3d_dit_image_policy import (
+                FlowMatchingRoPE3DDiTImagePolicy as _Policy,
+            )
+        elif pos_encoding == "rope4d":
+            from diffusion_policy.policy.flow_matching_rope4d_dit_image_policy import (
+                FlowMatchingRoPE4DDiTImagePolicy as _Policy,
+            )
+        else:
+            raise ValueError(
+                f"unknown pos_encoding {pos_encoding!r}; expected rope4d or rope3d"
+            )
+
+        return _Policy(
             shape_meta=shape_meta,
             horizon=self.horizon,
             n_action_steps=self.n_action_steps,
             n_obs_steps=self.n_obs_steps,
-            visual_encoder_type="dino_crossview",
-            visual_encoder_cfg=dict(_DINO_CROSSVIEW_DINOV2_CFG),
+            visual_encoder_type=enc_type,
+            visual_encoder_cfg=dict(enc_cfg),
+            visual_token_compression=compression,
             crop_shape=(self.image_size, self.image_size),
-            input_embedding_dim=_HIDDEN,
-            hidden_size=_HIDDEN,
-            diffusion_model_cfg=dict(_DIFFUSION_MODEL_CFG_ROPE4D),
+            **enc_kwargs,
+            input_embedding_dim=hidden,
+            hidden_size=hidden,
+            diffusion_model_cfg=dit_cfg,
             # World coords are in meters (~0–1.5). xyz_scale=100 puts them in
             # RoPE's resolvable frequency band; time_scale=18 maps t to integer
             # step indices over n_obs_steps + horizon.
