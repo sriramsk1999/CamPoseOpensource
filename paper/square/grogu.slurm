@@ -51,9 +51,20 @@ conda activate know_your_camera
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
-# train.py calls wandb.init unconditionally and will hang on an interactive
-# login prompt under a batch scheduler. Sync after the fact with `wandb sync`.
-export WANDB_MODE="${WANDB_MODE:-offline}"
+# wandb. train.py calls wandb.init unconditionally, and with no credentials
+# that can block on a login prompt under a batch scheduler — which is the only
+# reason to go offline. So: online whenever credentials exist (sbatch
+# --export=ALL carries WANDB_API_KEY over from the submitting shell), and
+# offline only as a loud fallback, never silently.
+if [ -n "${WANDB_MODE:-}" ]; then
+    export WANDB_MODE
+elif [ -n "${WANDB_API_KEY:-}" ] || [ -f "$HOME/.netrc" ]; then
+    export WANDB_MODE=online
+else
+    echo "WARNING: no WANDB_API_KEY and no ~/.netrc -- running OFFLINE." >&2
+    echo "WARNING: recover the dashboard later with: wandb sync wandb/offline-run-*" >&2
+    export WANDB_MODE=offline
+fi
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 

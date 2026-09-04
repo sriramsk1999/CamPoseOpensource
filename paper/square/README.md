@@ -113,6 +113,12 @@ Keep those exports: without them mujoco fails silently with black frames rather
 than crashing, which looks like a run whose loss falls normally but whose
 success rate sits at 0 on both pose files.
 
+wandb runs **online** when `WANDB_API_KEY` or `~/.netrc` is present (sbatch
+`--export=ALL` carries the key over from the submitting shell), and drops to
+offline with a warning only when neither is — `wandb.init` is unconditional in
+`train.py` and can block on a login prompt under a scheduler. Force either with
+`WANDB_MODE=`.
+
 `SAVE_EVERY` is 2000 there rather than 5000: every Grogu partition is
 `PreemptMode=REQUEUE`, and at ~3.2 s/epoch 5000 would put ~4.4 h of work at
 risk per preemption.
